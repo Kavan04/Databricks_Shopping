@@ -11,7 +11,8 @@ Goal: the top of the Shopping Sessions leaderboard. At the time of the first sub
 | v2.1 | `451a10f` | not submitted | ~13% faster than v2 in an interleaved A/B | same, plus dev MATCH with 997-byte and 64-byte chunks (boundary stress) |
 | v3 | `2402180` | not submitted | **0.80 s** (v2.1: 1.04 s) | unit tests (fast parsers and scanner vs reference), 36/36 fixtures, dev MATCH, boundary stress, on arm64 and amd64; 20M identical to v1 |
 | v3.1 | `42e0506` | not submitted | **0.77 s** (v3 in the same A/B: 0.84 s) | unit tests, 36/36 fixtures + dev MATCH on arm64 and amd64; 20M identical to v1 |
-| v3.2 | see git log | not submitted yet | single-thread work 3.73 s vs 4.14 s for v3.1 (interleaved, min of 6) | unit tests, fixtures, dev (also 997 / 64-byte ranges) on arm64 and amd64; 20M identical to v1 |
+| v3.2 | `6f6ed83` | not submitted | single-thread work 3.73 s vs 4.14 s for v3.1 (interleaved, min of 6) | unit tests, fixtures, dev (also 997 / 64-byte ranges) on arm64 and amd64; 20M identical to v1 |
+| v3.3 | see git log | not submitted yet | exit work after the last stage: best 15 ms vs 57 ms | same suite, both platforms; 20M identical to v1 |
 
 Local timings come from a Docker VM on an 8-core Apple-silicon Mac, with the data in `/dev/shm`. The Mac is often loaded, so one run can vary 2 to 3x. Only best-of-N is meaningful, and only the board counts.
 
@@ -190,6 +191,23 @@ Tried and dropped (single-thread minimums, 4 runs each):
 | Software prefetch 512 B to 4 KB ahead in the scanner | slower: stage 1 2.2 s vs 1.96 s without |
 | Prefetch dedup table slots and the record stream 8 ahead | no change |
 | Person-lookup prefetch distance 8 / 16 / 32 / 64 | no change (kept 32) |
+
+## v3.2 -> v3.3: teardown
+
+The clock runs until the container exits, and exiting is not free. Measured from the end of stage 3 to process exit (20M, 8 threads): 60 to 100 ms, about 9% of a run. Most of it is the kernel tearing down, on one thread:
+* about 1 GB of arena memory
+* the page mappings of 1.8 GB of input
+
+Write-ups from the One Billion Row Challenge note the same effect: unmapping cost is charged to wall-clock time. v3.3 moves that work into the parallel stages:
+* Each stage 1 worker drops the page mappings of a range right after parsing it (`MADV_DONTNEED`). The pages stay in the page cache.
+* After stage 3, all workers give the arena back together (`MADV_DONTNEED` in 64 MB pieces).
+
+The local A/B is noisy. The best case went from 57 ms to 15 ms; on theory the change only moves serial work into parallel work.
+
+## Scale check (40M events, seed 11)
+
+* Runs end to end. Sessions and revenue sums match across the two tables, assists cover credited sessions, and there are no duplicate keys.
+* Process memory is about 3 GB; the 6.4 to 6.7 GB cgroup peak includes the 3.6 GB input in page cache. That points to about 4.5 GB at 60M, well under 24 GB.
 
 ## Backlog (ordered by expected gain)
 

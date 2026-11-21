@@ -185,6 +185,7 @@ static LAHEAD: AtomicUsize = AtomicUsize::new(32);
 
 fn stage1(ctx: &Ctx, arena: &Arena, files: &[InFile], tasks: &[RTask], nt: usize, lt: &LinkTable) -> Vec<S1> {
     let next = AtomicUsize::new(0);
+    let keep_maps = std::env::var_os("FM_NORELEASE").is_some();
     let (nb1, nb2) = (1usize << ctx.b1bits, 1usize << ctx.b2bits);
     thread::scope(|s| {
         let hs: Vec<_> = (0..nt)
@@ -227,6 +228,9 @@ fn stage1(ctx: &Ctx, arena: &Arena, files: &[InFile], tasks: &[RTask], nt: usize
                                 c.person = lt.resolve(c.person);
                                 ck[bucket(c.person, ctx.b2bits)].push(c, &mut blocks);
                             }
+                        }
+                        if !keep_maps {
+                            release_range(&files[t.file], t.off, t.len);
                         }
                     }
                     S1 {
@@ -859,6 +863,9 @@ fn main() {
     let cat_refs: Vec<&[u8]> = cats.iter().map(|c| &c[..]).collect();
     let w3 = stage3(&ctx, &names, &s1, &s2, nt, &cat_refs, &out_dir);
     lap("stage3 sessions + user_daily");
+    if std::env::var_os("FM_NORELEASE").is_none() {
+        arena.release(nt);
+    }
 
     // campaign table
     let mut cstat = vec![0u64; (ncamp + 1) * ndays * 4];

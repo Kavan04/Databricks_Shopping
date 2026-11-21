@@ -239,6 +239,21 @@ pub fn prefetch_range(f: &InFile, off: usize, len: usize) {
     madvise(&f.bytes()[off..off + len], libc::MADV_WILLNEED);
 }
 
+/// Drop this process's page mappings of a parsed range (the pages stay in the
+/// page cache; a later touch maps them again). Done by the worker right after
+/// parsing, so the kernel's teardown work is spread over all workers instead
+/// of running single-threaded at exit. Only whole pages inside the range.
+pub fn release_range(f: &InFile, off: usize, len: usize) {
+    let a = f.ptr as usize + off;
+    let start = (a + 4095) & !4095;
+    let end = (a + len) & !4095;
+    if end > start {
+        unsafe {
+            libc::madvise(start as *mut libc::c_void, end - start, libc::MADV_DONTNEED);
+        }
+    }
+}
+
 /// The complete lines that start in [off, off+len); the header line is skipped
 /// when off == 0. PAD readable bytes always follow the returned slice. Its pages
 /// are mapped in with one call, not one fault per page.

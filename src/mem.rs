@@ -64,6 +64,41 @@ impl Arena {
     }
 }
 
+impl Arena {
+    /// Give all arena memory back to the kernel from `nt` threads at once. The
+    /// kernel would otherwise free it single-threaded at exit. Nothing may read
+    /// arena records afterwards.
+    pub fn release(&self, nt: usize) {
+        let used = self.next.load(Relaxed) * BLK;
+        let mut ranges = Vec::new();
+        for (i, sg) in self.segs.iter().enumerate() {
+            let p = sg.load(Acquire);
+            if p.is_null() {
+                continue;
+            }
+            let len = used.saturating_sub(i * SEG_BYTES).min(SEG_BYTES);
+            const PIECE: usize = 64 << 20;
+            let mut o = 0;
+            while o < len {
+                ranges.push((p as usize + o, PIECE.min(len - o)));
+                o += PIECE;
+            }
+        }
+        let next = AtomicUsize::new(0);
+        std::thread::scope(|s| {
+            for _ in 0..nt.min(ranges.len()).max(1) {
+                s.spawn(|| loop {
+                    let i = next.fetch_add(1, Relaxed);
+                    let Some(&(p, len)) = ranges.get(i) else { break };
+                    unsafe {
+                        libc::madvise(p as *mut libc::c_void, len, libc::MADV_DONTNEED);
+                    }
+                });
+            }
+        });
+    }
+}
+
 /// A worker's source of blocks: recycled ones first, then fresh arena blocks.
 pub struct Blocks<'a> {
     arena: &'a Arena,
