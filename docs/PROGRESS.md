@@ -10,11 +10,26 @@ Goal: the top of the Shopping Sessions leaderboard. At the time of the first sub
 | v2 | `88d363d` | not submitted | 0.93 s | 36/36 fixtures + dev MATCH on arm64 and amd64 (AVX2); 20M identical to v1 |
 | v2.1 | `451a10f` | not submitted | ~13% faster than v2 in an interleaved A/B | same, plus dev MATCH with 997-byte and 64-byte chunks (boundary stress) |
 | v3 | `2402180` | not submitted | **0.80 s** (v2.1: 1.04 s) | unit tests (fast parsers and scanner vs reference), 36/36 fixtures, dev MATCH, boundary stress, on arm64 and amd64; 20M identical to v1 |
-| v3.1 | `42e0506` | not submitted | **0.77 s** (v3 in the same A/B: 0.84 s) | unit tests, 36/36 fixtures + dev MATCH on arm64 and amd64; 20M identical to v1 |
+| v3.1 | `42e0506` | **1.45 s** | **0.77 s** (v3 in the same A/B: 0.84 s) | unit tests, 36/36 fixtures + dev MATCH on arm64 and amd64; 20M identical to v1 |
 | v3.2 | `6f6ed83` | not submitted | single-thread work 3.73 s vs 4.14 s for v3.1 (interleaved, min of 6) | unit tests, fixtures, dev (also 997 / 64-byte ranges) on arm64 and amd64; 20M identical to v1 |
-| v3.3 | see git log | not submitted yet | exit work after the last stage: best 15 ms vs 57 ms | same suite, both platforms; 20M identical to v1 |
+| v3.3 | `341b502` | **1.17 s** | exit work after the last stage: best 15 ms vs 57 ms | same suite, both platforms; 20M identical to v1 |
 
 Local timings come from a Docker VM on an 8-core Apple-silicon Mac, with the data in `/dev/shm`. The Mac is often loaded, so one run can vary 2 to 3x. Only best-of-N is meaningful, and only the board counts.
+
+## Local vs scorer
+
+| Version | Local best (8 threads) | Board | Board / local |
+| --- | --- | --- | --- |
+| v1 | 1.80 s | 1.95 s | 1.08 |
+| v3.1 | 0.77 s | 1.45 s | 1.9 |
+| v3.3 | ~0.70 s | 1.17 s | 1.7 |
+
+Since v1, every local gain has shrunk by roughly half on the board. v1 was dominated by computation. The later versions cut computation, so what remains is mostly memory traffic, page faults and page zeroing, and random lookups into large tables. The Apple-silicon dev Mac hides those costs: it has very high memory bandwidth, large caches, and huge pages on by default in its Linux VM. The scorer is a Cascade Lake VM: 4 cores with hyperthreading, 1 MB L2 per core, and unknown huge-page policy and fault costs. Local tuning was therefore aimed at the wrong machine.
+
+**Diagnostic build** (`diag` branch, `FM_DIAG=1`). The scorer returns logs only when the dev check fails, and a rejected submission never changes the best score. So this build prints scorer facts and measurements, then exits 1:
+* CPU, caches, huge-page policy, kernel, mounts
+* page-fault, bandwidth, random-access and input-read microbenchmarks
+* per-stage user/kernel times for six pipeline runs on a 20x tiled dev set in `/scratch`: 8, 4 and 1 threads, and huge pages on
 
 ## Where the time goes
 
