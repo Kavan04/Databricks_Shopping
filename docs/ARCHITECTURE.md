@@ -14,7 +14,7 @@ How `src/` turns the CSV logs in `/data` into the two Parquet tables. The spec i
 
 ```mermaid
 flowchart LR
-    subgraph IN["/data (mmap, read-only)"]
+    subgraph IN["/data (read-only)"]
         L[links/*.csv]
         E[events/*.csv]
         C[clicks/*.csv]
@@ -26,7 +26,7 @@ flowchart LR
     L -->|"A1 parallel parse"| LR["LinkRec pairs"]
     LR -->|"A2 union-find<br/>(own thread)"| LT[("LinkTable<br/>id key -> person key")]
 
-    E -->|"B parse + validate<br/>8 threads, 4 MB chunks"| EB["E1 buckets<br/>by event_id<br/>32 B / event"]
+    E -->|"B pread 4 MB ranges into<br/>per-worker buffers, parse + validate"| EB["E1 buckets<br/>by event_id<br/>32 B / event"]
     C -->|"B parse + validate<br/>waits for LinkTable"| CB["Ck buckets<br/>by person<br/>24 B / click"]
     LT -.-> CB
 
@@ -95,13 +95,31 @@ flowchart LR
 
 ## 5. Stage B: parse
 
+Events and clicks are cut into 4 MB byte ranges, not line-aligned. A worker `pread`s its range, plus a little slack, into a reused buffer and parses exactly the lines that **start** inside the range:
+
+* the header line when the range begins at 0
+* the partial line at the front, which belongs to the previous range, is skipped
+* the line that runs past the end is finished from the slack, read further if needed
+
+Reading into a warm buffer avoids the page faults of touching a fresh `mmap` page by page. Those faults cost as much as parsing itself. The next ranges are announced with `posix_fadvise(WILLNEED)` so a cold disk streams ahead. Links are small and still use `mmap`.
+
+```mermaid
+flowchart LR
+    F["file bytes"] --> R1["range k: [off, off+len)"]
+    R1 --> P["pread [off-1, off+len+slack)"]
+    P --> S["start = after first newline<br/>(after header if off = 0)"]
+    P --> E["end = first newline at or after off+len-1<br/>(read more if none)"]
+    S --> L["lines starting in range"]
+    E --> L
+```
+
 `scan::for_each_record` loads 64 bytes at a time and builds three bitmasks (comma, quote, newline) with AVX2 on the scorer (NEON on ARM). Each line's field boundaries come straight from the mask bits, and the dialect check runs on those positions:
 
 * exactly N fields
 * a quote only as the first and last byte of a field
 * everything else malformed
 
-`\r` is ordinary data because only `\n` is looked for.
+A line with no quote at all takes a fast path straight from the comma positions. `\r` is ordinary data because only `\n` is looked for.
 
 ```mermaid
 flowchart TD

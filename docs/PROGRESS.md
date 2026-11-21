@@ -7,7 +7,8 @@ Goal: the top of the Shopping Sessions leaderboard. At the time of the first sub
 | Version | Commit | Practice score (20M, scorer) | Local best, 20M, data in RAM | Correct |
 | --- | --- | --- | --- | --- |
 | v1 | `4a02f9d` | **1.95 s** | 1.80 s | 36/36 fixtures, dev MATCH |
-| v2 | see git log | not submitted yet | 0.93 s | 36/36 fixtures + dev MATCH on arm64 and amd64 (AVX2); 20M identical to v1 |
+| v2 | `88d363d` | not submitted | 0.93 s | 36/36 fixtures + dev MATCH on arm64 and amd64 (AVX2); 20M identical to v1 |
+| v2.1 | see git log | not submitted yet | ~13% faster than v2 in an interleaved A/B | same, plus dev MATCH with 997-byte and 64-byte chunks (boundary stress) |
 
 Local timings come from a Docker VM on an 8-core Apple-silicon Mac, with the data in `/dev/shm`. The Mac is often loaded, so one run can vary 2 to 3x. Only best-of-N is meaningful, and only the board counts.
 
@@ -55,6 +56,20 @@ flowchart LR
     end
 ```
 
+## Measurements behind v2.1
+
+Single-thread scanner throughput on memory that is already touched, on one 256 MB event file (best of 5):
+
+| Step | Throughput |
+| --- | --- |
+| SIMD masks only | 17 GB/s |
+| + cut lines and fields | 2.1 GB/s |
+| + two ID keys | 1.55 GB/s |
+| + two timestamps | 1.2 to 1.4 GB/s |
+| (memchr for newlines, reference) | 29 to 35 GB/s |
+
+Inside the pipeline, the same field-splitting step ran at about half that speed. The difference was first-touch page faults on the `mmap`ed input. Hence the switch to `pread`.
+
 ## Experiments
 
 | Idea | Result | Kept? |
@@ -66,10 +81,12 @@ flowchart LR
 | Exact packed ID keys | Removes hashing, string pointers and collision risk | yes |
 | Union-find on its own thread | Takes about 0.18 s of serial work off the critical path | yes |
 | 16-byte person records | Halves stage 3 traffic | yes |
+| `pread` ranges into reused buffers instead of `mmap` | ~13% faster end to end in an interleaved A/B; stage 1 no longer pays input page faults | yes |
+| Fast path in field split for quote-free lines | Skips per-field quote checks for most lines | yes |
 
 ## Backlog (ordered by expected gain)
 
-1. Stage 1 per-line cost: cheaper timestamp parse, fewer branches in `fields`, ID keys from the mask positions.
+1. Stage 1 per-line cost: cheaper timestamp parse (SWAR digit checks), SWAR ID-key packing.
 2. Kernel page-fault cost: reuse stage 1 blocks for stage 2 output, and pre-fault the arena in parallel.
 3. Stage 3: radix sort, or group by a dense person index, instead of comparison sort.
 4. Thread count above `NCPU` to hide page faults; tune bucket counts for 60M.

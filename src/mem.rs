@@ -29,6 +29,9 @@ fn map_anon(n: usize) -> *mut u8 {
         if std::env::var_os("FM_THP").is_some() {
             libc::madvise(p, n, libc::MADV_HUGEPAGE);
         }
+        if std::env::var_os("FM_NOTHP").is_some() {
+            libc::madvise(p, n, libc::MADV_NOHUGEPAGE);
+        }
         p as *mut u8
     }
 }

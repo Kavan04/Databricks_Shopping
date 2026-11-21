@@ -98,6 +98,16 @@ fn fields<'a, const N: usize>(
         return None;
     }
     let mut out: [&[u8]; N] = [&d[0..0]; N];
+    if nq == 0 {
+        // no quotes anywhere on the line: fields are exactly the comma gaps
+        let mut s = s0;
+        for k in 0..N {
+            let e = if k < N - 1 { commas[k] as usize } else { e0 };
+            out[k] = unsafe { d.get_unchecked(s..e) };
+            s = e + 1;
+        }
+        return Some(out);
+    }
     let mut qi = 0usize;
     let mut s = s0;
     for k in 0..N {
@@ -190,4 +200,8 @@ pub fn body(data: &'static [u8]) -> &'static [u8] {
         Some(i) => &data[i + 1..],
         None => &data[data.len()..],
     }
+}
+
+pub fn bench_masks(c: &[u8]) -> (u64, u64, u64) {
+    unsafe { masks(c.as_ptr()) }
 }

@@ -99,11 +99,67 @@ struct Task {
     kind: u8, // 0 events, 1 clicks, 2 links
 }
 
+/// A byte range of an input file; its worker parses the lines that start inside it.
+struct RTask {
+    file: usize,
+    off: usize,
+    len: usize,
+    kind: u8, // 0 events, 1 clicks
+}
+
+struct InFile {
+    f: File,
+    size: usize,
+}
+
+fn fadvise_willneed(f: &InFile, off: usize, len: usize) {
+    use std::os::fd::AsRawFd;
+    unsafe {
+        libc::posix_fadvise(f.f.as_raw_fd(), off as libc::off_t, len as libc::off_t, libc::POSIX_FADV_WILLNEED);
+    }
+}
+
+/// Read the complete lines that start in [off, off+len) into `buf`; the header
+/// line is skipped when off == 0. Returns the line bytes inside `buf`.
+fn read_lines<'b>(file: &InFile, off: usize, len: usize, buf: &'b mut Vec<u8>) -> &'b [u8] {
+    use std::os::unix::fs::FileExt;
+    let rs = off.saturating_sub(1);
+    let limit = off + len - rs; // first buffer index not owned by this task
+    let mut slack = 4096;
+    loop {
+        let want = (off + len + slack).min(file.size) - rs;
+        buf.clear();
+        buf.reserve(want);
+        unsafe { buf.set_len(want) };
+        file.f.read_exact_at(&mut buf[..], rs as u64).expect("read input");
+        let start = match memchr::memchr(b'\n', &buf[..]) {
+            Some(i) => i + 1,
+            None if rs + want == file.size => return &buf[want..],
+            None => {
+                slack *= 4;
+                continue;
+            }
+        };
+        if start >= limit {
+            return &buf[start.min(want)..start.min(want)];
+        }
+        let end = match memchr::memchr(b'\n', &buf[limit - 1..]) {
+            Some(i) => limit - 1 + i,
+            None if rs + want == file.size => want,
+            None => {
+                slack *= 4;
+                continue;
+            }
+        };
+        return &buf[start..end];
+    }
+}
+
 struct S1 {
     ev: Vec<Vec<Seg<E1>>>,
     ck: Vec<Vec<Seg<Ck>>>,
     /// strings of keys that are hashes (rare), for names and click_id ties
-    strs: Vec<(u64, &'static [u8])>,
+    strs: Vec<(u64, Vec<u8>)>,
 }
 
 // ---------------------------------------------------------------- links
@@ -200,7 +256,7 @@ fn build_links(parts: Vec<Vec<LinkRec>>) -> LinkTable {
 // ---------------------------------------------------------------- stage 1: parse
 
 #[inline(always)]
-fn parse_event(ctx: &Ctx, f: &[&'static [u8]; 7], strs: &mut Vec<(u64, &'static [u8])>) -> Option<E1> {
+fn parse_event(ctx: &Ctx, f: &[&[u8]; 7], strs: &mut Vec<(u64, Vec<u8>)>) -> Option<E1> {
     if f[0].is_empty() {
         return None;
     }
@@ -228,13 +284,13 @@ fn parse_event(ctx: &Ctx, f: &[&'static [u8]; 7], strs: &mut Vec<(u64, &'static 
     }
     let user = id_key(f[1]);
     if !is_packed(user) {
-        strs.push((user, f[1]));
+        strs.push((user, f[1].to_vec()));
     }
     Some(E1 { eid, user, w2, ing: (ingc << 1) | 1 })
 }
 
 #[inline(always)]
-fn parse_click(ctx: &Ctx, lt: &LinkTable, f: &[&'static [u8]; 4], strs: &mut Vec<(u64, &'static [u8])>) -> Option<Ck> {
+fn parse_click(ctx: &Ctx, lt: &LinkTable, f: &[&[u8]; 4], strs: &mut Vec<(u64, Vec<u8>)>) -> Option<Ck> {
     if f[0].is_empty() || f[1].is_empty() {
         return None;
     }
@@ -245,24 +301,12 @@ fn parse_click(ctx: &Ctx, lt: &LinkTable, f: &[&'static [u8]; 4], strs: &mut Vec
     let camp = ctx.camps.get(skey(f[2]))?;
     let ckey = id_key(f[0]);
     if !is_packed(ckey) {
-        strs.push((ckey, f[0]));
+        strs.push((ckey, f[0].to_vec()));
     }
     Some(Ck { person: lt.resolve(id_key(f[1])), w1: (((t - ctx.base) as u64) << 24) | camp, ckey })
 }
 
-fn madv_willneed(d: &[u8]) {
-    if d.is_empty() {
-        return;
-    }
-    let a = d.as_ptr() as usize;
-    let start = a & !4095;
-    let len = (a + d.len() - start + 4095) & !4095;
-    unsafe {
-        libc::madvise(start as *mut libc::c_void, len, libc::MADV_WILLNEED);
-    }
-}
-
-fn stage1(ctx: &Ctx, arena: &Arena, tasks: &[Task], nt: usize, lt: &OnceLock<LinkTable>) -> Vec<S1> {
+fn stage1(ctx: &Ctx, arena: &Arena, files: &[InFile], tasks: &[RTask], nt: usize, lt: &OnceLock<LinkTable>) -> Vec<S1> {
     let next = AtomicUsize::new(0);
     let (nb1, nb2) = (1usize << ctx.b1bits, 1usize << ctx.b2bits);
     thread::scope(|s| {
@@ -272,24 +316,26 @@ fn stage1(ctx: &Ctx, arena: &Arena, tasks: &[Task], nt: usize, lt: &OnceLock<Lin
                     let mut ev: Vec<Bkt<E1>> = (0..nb1).map(|_| Bkt::new()).collect();
                     let mut ck: Vec<Bkt<Ck>> = (0..nb2).map(|_| Bkt::new()).collect();
                     let mut strs = Vec::new();
+                    let mut buf: Vec<u8> = Vec::with_capacity(CHUNK + (64 << 10));
                     loop {
                         let i = next.fetch_add(1, Relaxed);
                         if i >= tasks.len() {
                             break;
                         }
-                        if let Some(ahead) = tasks.get(i + 2 * nt) {
-                            madv_willneed(ahead.data);
+                        if let Some(a) = tasks.get(i + 2 * nt) {
+                            fadvise_willneed(&files[a.file], a.off, a.len);
                         }
                         let t = &tasks[i];
+                        let data = read_lines(&files[t.file], t.off, t.len, &mut buf);
                         if t.kind == 0 {
-                            for_each_record::<7>(t.data, |f| {
+                            for_each_record::<7>(data, |f| {
                                 if let Some(e) = parse_event(ctx, f, &mut strs) {
                                     ev[bucket(e.eid, ctx.b1bits)].push(e, arena);
                                 }
                             });
                         } else {
                             let lt = lt.wait();
-                            for_each_record::<4>(t.data, |f| {
+                            for_each_record::<4>(data, |f| {
                                 if let Some(c) = parse_click(ctx, lt, f, &mut strs) {
                                     ck[bucket(c.person, ctx.b2bits)].push(c, arena);
                                 }
@@ -426,7 +472,7 @@ fn ck_camp(c: &Ck) -> usize {
     (c.w1 & 0xFF_FFFF) as usize
 }
 
-type Names = HashMap<u64, &'static [u8]>;
+type Names = HashMap<u64, Vec<u8>>;
 
 fn name_of(k: u64, names: &Names, out: &mut Vec<u8>) {
     if is_packed(k) {
@@ -677,13 +723,57 @@ fn json_str(txt: &str, key: &str) -> String {
     rest[a..b].to_string()
 }
 
+/// user + system CPU seconds used by the process so far
+fn cpu_secs() -> f64 {
+    let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
+    unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut ru) };
+    let t = |v: libc::timeval| v.tv_sec as f64 + v.tv_usec as f64 * 1e-6;
+    t(ru.ru_utime) + t(ru.ru_stime)
+}
+
 fn log2_ceil(x: usize) -> u32 {
     x.max(1).next_power_of_two().trailing_zeros()
 }
 
+
+fn bench_scan(path: &str) {
+    let d = body(map_file(Path::new(path)).unwrap());
+    let d = &d[..d.len().min(256 << 20)];
+    let mut sum = 0u64;
+    for b in d.iter().step_by(4096) {
+        sum += *b as u64;
+    }
+    std::hint::black_box(sum);
+    let cut = |n: usize| -> &[u8] { let e = memchr::memrchr(b'\n', &d[..n]).unwrap() + 1; &d[..e] };
+    let d = cut(d.len());
+    let mut res = Vec::new();
+    for mode in 0..5 {
+        let mut best = f64::MAX;
+        for _ in 0..5 {
+            let t = Instant::now();
+            let mut acc = 0u64;
+            match mode {
+                0 => { let mut n = 0u64; for c in d.chunks(64) { if c.len() == 64 { let (a, b, e) = scan::bench_masks(c); n = n.wrapping_add(a ^ b ^ e); } } acc = n; }
+                1 => { for_each_record::<7>(d, |f| { acc = acc.wrapping_add(f[2].len() as u64); }); }
+                2 => { for_each_record::<7>(d, |f| { acc = acc.wrapping_add(id_key(f[0]) ^ id_key(f[1])); }); }
+                3 => { for_each_record::<7>(d, |f| { acc = acc.wrapping_add((parse_ts(f[2]).unwrap_or(0) ^ parse_ts(f[3]).unwrap_or(0)) as u64); }); }
+                _ => { acc = memchr::memchr_iter(b'\n', d).count() as u64; }
+            }
+            std::hint::black_box(acc);
+            best = best.min(t.elapsed().as_secs_f64());
+        }
+        res.push(format!("{}={:.0}MB/s", ["masks", "records", "+idkeys", "+2ts", "memchr_nl"][mode], d.len() as f64 / best / 1e6));
+    }
+    eprintln!("bench {} bytes: {}", d.len(), res.join(" "));
+}
+
 fn main() {
     let t0 = Instant::now();
-    let lap = |what: &str| eprintln!("[{:7.3}s] {}", t0.elapsed().as_secs_f64(), what);
+    if let Ok(f) = std::env::var("BENCH") {
+        bench_scan(&f);
+        return;
+    }
+    let lap = |what: &str| eprintln!("[{:7.3}s] {} cpu={:.3}", t0.elapsed().as_secs_f64(), what, cpu_secs());
     let data_dir = PathBuf::from(std::env::var("DATA_DIR").unwrap_or("/data".into()));
     let out_dir = PathBuf::from(std::env::var("OUTPUT_DIR").unwrap_or("/output".into()));
     let nt: usize = std::env::var("NCPU")
@@ -737,28 +827,37 @@ fn main() {
     let ncamp = camp_ids.len();
     assert!(ncamp < (1 << 24) - 1);
 
-    // inputs
-    let mut tasks = Vec::new();
-    let mut ck_tasks = Vec::new();
-    let mut lk_tasks = Vec::new();
+    // inputs: events and clicks are read with pread into per-worker buffers
+    let mut files: Vec<InFile> = Vec::new();
+    let mut tasks: Vec<RTask> = Vec::new();
     let mut ev_bytes = 0usize;
-    for p in list_csv(&data_dir.join("events")) {
-        if let Some(d) = map_file(&p) {
-            ev_bytes += d.len();
-            push_chunks(&mut tasks, d, 0);
+    let chunk: usize = std::env::var("FM_CHUNK").ok().and_then(|v| v.parse().ok()).unwrap_or(CHUNK).max(1);
+    for (kind, dir) in [(0u8, "events"), (1u8, "clicks")] {
+        for p in list_csv(&data_dir.join(dir)) {
+            let f = File::open(&p).expect("open input");
+            let size = f.metadata().unwrap().len() as usize;
+            if size == 0 {
+                continue;
+            }
+            if kind == 0 {
+                ev_bytes += size;
+            }
+            let fi = files.len();
+            files.push(InFile { f, size });
+            let mut off = 0;
+            while off < size {
+                let len = chunk.min(size - off);
+                tasks.push(RTask { file: fi, off, len, kind });
+                off += len;
+            }
         }
     }
-    for p in list_csv(&data_dir.join("clicks")) {
-        if let Some(d) = map_file(&p) {
-            push_chunks(&mut ck_tasks, d, 1);
-        }
-    }
+    let mut lk_tasks = Vec::new();
     for p in list_csv(&data_dir.join("links")) {
         if let Some(d) = map_file(&p) {
             push_chunks(&mut lk_tasks, d, 2);
         }
     }
-    tasks.extend(ck_tasks);
     let est_rows = ev_bytes / 64 + 1;
     let b1bits = log2_ceil(est_rows / 32768).clamp(6, 11);
     let b2bits = log2_ceil(est_rows / 24576).clamp(6, 11);
@@ -796,7 +895,7 @@ fn main() {
     let ctx = Ctx { ws, we, base, day0, ndays, camps, ncamp, prods, unknown_cat, b1bits, b2bits };
     let arena = Arena::new();
     for t in tasks.iter().take(2 * nt) {
-        madv_willneed(t.data);
+        fadvise_willneed(&files[t.file], t.off, t.len);
     }
 
     // union-find runs on its own thread while stage 1 parses events
@@ -808,7 +907,7 @@ fn main() {
             eprintln!("[{:7.3}s] links joined ({} mapped ids)", t0.elapsed().as_secs_f64(), lt.map.len());
             let _ = cell.set(lt);
         });
-        stage1(&ctx, &arena, &tasks, nt, cell)
+        stage1(&ctx, &arena, &files, &tasks, nt, cell)
     });
     let lt = lt_cell.into_inner().unwrap();
     lap("stage1 parse");
@@ -818,12 +917,12 @@ fn main() {
 
     let mut names: Names = HashMap::new();
     for w in &s1 {
-        for &(k, s) in &w.strs {
-            names.insert(k, s);
+        for (k, s) in &w.strs {
+            names.insert(*k, s.clone());
         }
     }
     for &(k, s) in &lt.names {
-        names.insert(k, s);
+        names.insert(k, s.to_vec());
     }
     let w3 = stage3(&ctx, &names, &s1, &s2, nt, cats.len());
     lap("stage3 sessions");
