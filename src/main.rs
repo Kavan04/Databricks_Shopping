@@ -542,7 +542,9 @@ fn scatter<T: Copy>(segs: &[&[Seg<T>]], n: usize, nsub: usize, sub: impl Fn(&T) 
     unsafe { dst.set_len(n) };
 }
 
-fn stage3(ctx: &Ctx, names: &Names, s1: &[S1], s2: &[Vec<Vec<Seg<Ev>>>], nt: usize, ncat: usize) -> Vec<W3> {
+/// Each worker writes its own user_daily file as soon as its buckets are done.
+fn stage3(ctx: &Ctx, names: &Names, s1: &[S1], s2: &[Vec<Vec<Seg<Ev>>>], nt: usize, cats: &[&[u8]], out_dir: &Path) -> Vec<W3> {
+    let ncat = cats.len();
     let ncamp = ctx.ncamp;
     let nb2 = 1usize << ctx.b2bits;
     let b2bits = ctx.b2bits;
@@ -552,8 +554,10 @@ fn stage3(ctx: &Ctx, names: &Names, s1: &[S1], s2: &[Vec<Vec<Seg<Ev>>>], nt: usi
     let next = AtomicUsize::new(0);
     thread::scope(|s| {
         let hs: Vec<_> = (0..nt)
-            .map(|_| {
-                s.spawn(|| {
+            .map(|wi| {
+                let next = &next;
+                let order = &order;
+                s.spawn(move || {
                     let mut w = W3 {
                         cstat: vec![0; (ncamp + 1) * ctx.ndays * 4],
                         urows: Vec::new(),
@@ -591,9 +595,16 @@ fn stage3(ctx: &Ctx, names: &Names, s1: &[S1], s2: &[Vec<Vec<Seg<Ev>>>], nt: usi
                                 continue;
                             }
                             let evs = &mut ev[es..ee];
-                            sort_small(evs, |e| (e.person, e.w2));
+                            let p0 = evs[0].person;
                             let cks = &mut ck[ccnt[j] as usize..ccnt[j + 1] as usize];
-                            sort_small(cks, |c| (c.person, c.w1));
+                            if evs.iter().all(|e| e.person == p0) && cks.iter().all(|c| c.person == p0) {
+                                // one person (the usual case): order by time alone
+                                sort_small(evs, |e| e.w2);
+                                sort_small(cks, |c| c.w1);
+                            } else {
+                                sort_small(evs, |e| (e.person, e.w2));
+                                sort_small(cks, |c| (c.person, c.w1));
+                            }
                             let mut ci = 0;
                             let mut i = 0;
                             while i < evs.len() {
@@ -614,6 +625,10 @@ fn stage3(ctx: &Ctx, names: &Names, s1: &[S1], s2: &[Vec<Vec<Seg<Ev>>>], nt: usi
                                 i = e;
                             }
                         }
+                    }
+                    if !w.urows.is_empty() {
+                        let name = |k: u64, buf: &mut Vec<u8>| name_of(k, names, buf);
+                        write_user(&out_dir.join("user_daily").join(format!("part-{}.parquet", wi)), &w.urows, cats, &name);
                     }
                     w
                 })
@@ -771,8 +786,11 @@ fn main() {
     for (k, s) in &lt.names {
         names.insert(*k, s.clone());
     }
-    let w3 = stage3(&ctx, &names, &s1, &s2, nt, cats.len());
-    lap("stage3 sessions");
+    std::fs::create_dir_all(out_dir.join("user_daily")).unwrap();
+    std::fs::create_dir_all(out_dir.join("campaign_daily")).unwrap();
+    let cat_refs: Vec<&[u8]> = cats.iter().map(|c| &c[..]).collect();
+    let w3 = stage3(&ctx, &names, &s1, &s2, nt, &cat_refs, &out_dir);
+    lap("stage3 sessions + user_daily");
 
     // campaign table
     let mut cstat = vec![0u64; (ncamp + 1) * ndays * 4];
@@ -793,22 +811,14 @@ fn main() {
         }
     }
 
-    std::fs::create_dir_all(out_dir.join("user_daily")).unwrap();
-    std::fs::create_dir_all(out_dir.join("campaign_daily")).unwrap();
     let total: usize = w3.iter().map(|w| w.urows.len()).sum();
-    let name = |k: u64, buf: &mut Vec<u8>| name_of(k, &names, buf);
-    let cat_refs: Vec<&[u8]> = cats.iter().map(|c| &c[..]).collect();
-    thread::scope(|s| {
-        s.spawn(|| write_campaign(&out_dir.join("campaign_daily").join("part-0.parquet"), &crows));
-        for (i, w) in w3.iter().enumerate() {
-            if w.urows.is_empty() && !(i == 0 && total == 0) {
-                continue;
-            }
-            let p = out_dir.join("user_daily").join(format!("part-{}.parquet", i));
-            let (cats, name) = (&cat_refs, &name);
-            s.spawn(move || write_user(&p, &w.urows, cats, name));
-        }
-    });
+    if total == 0 {
+        let name = |k: u64, buf: &mut Vec<u8>| name_of(k, &names, buf);
+        write_user(&out_dir.join("user_daily").join("part-0.parquet"), &[], &cat_refs, &name);
+    }
+    write_campaign(&out_dir.join("campaign_daily").join("part-0.parquet"), &crows);
     lap("written");
     eprintln!("user rows {} campaign rows {}", total, crows.len());
+    // skip destructors: the kernel reclaims everything at exit anyway
+    std::process::exit(0);
 }

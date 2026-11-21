@@ -9,7 +9,8 @@ Goal: the top of the Shopping Sessions leaderboard. At the time of the first sub
 | v1 | `4a02f9d` | **1.95 s** | 1.80 s | 36/36 fixtures, dev MATCH |
 | v2 | `88d363d` | not submitted | 0.93 s | 36/36 fixtures + dev MATCH on arm64 and amd64 (AVX2); 20M identical to v1 |
 | v2.1 | `451a10f` | not submitted | ~13% faster than v2 in an interleaved A/B | same, plus dev MATCH with 997-byte and 64-byte chunks (boundary stress) |
-| v3 | see git log | not submitted yet | **0.80 s** (v2.1: 1.04 s) | unit tests (fast parsers and scanner vs reference), 36/36 fixtures, dev MATCH, boundary stress, on arm64 and amd64; 20M identical to v1 |
+| v3 | `2402180` | not submitted | **0.80 s** (v2.1: 1.04 s) | unit tests (fast parsers and scanner vs reference), 36/36 fixtures, dev MATCH, boundary stress, on arm64 and amd64; 20M identical to v1 |
+| v3.1 | see git log | not submitted yet | **0.77 s** (v3 in the same A/B: 0.84 s) | unit tests, 36/36 fixtures + dev MATCH on arm64 and amd64; 20M identical to v1 |
 
 Local timings come from a Docker VM on an 8-core Apple-silicon Mac, with the data in `/dev/shm`. The Mac is often loaded, so one run can vary 2 to 3x. Only best-of-N is meaningful, and only the board counts.
 
@@ -143,9 +144,25 @@ Inside the pipeline, the same field-splitting step ran at about half that speed.
 | v3 padded `mmap` + `POPULATE_READ` instead of `pread` | Same single-thread work here (tmpfs), but less memory traffic: best 8-thread run 0.80 s vs 0.97 s | yes |
 | `MAP_POPULATE`, `MADV_HUGEPAGE`, `MADV_NOHUGEPAGE` on the arena | No difference beyond noise (single thread, 3 rounds) | no |
 
+## v3 -> v3.1
+
+* A blocked Bloom filter in each link-map partition (2 bits per key in one u64, about 2 bytes per linked id) answers most "not linked" lookups from cache. Prefetches are skipped for ids it rules out.
+* In stage 3, a group holding one person, which is the usual case, is sorted by time alone.
+* Each worker writes its user_daily file as soon as its buckets are done, so writing overlaps with other workers' sessionizing.
+* The process exits without running destructors.
+
+Measured single-thread splits behind these choices (minimum of 7 runs, 20M):
+
+| Experiment | Stage 1 |
+| --- | --- |
+| normal | 1.91 s |
+| no `POPULATE_READ` (plain page faults) | 1.91 s |
+| records pushed to a 64 KB scratch ring instead of buckets | 1.54 s |
+
+So bucket pushes, which write fresh memory, cost about 0.37 s of single-thread work. Pre-faulting the input changes nothing. With 256, 1024 or 4096 event buckets, stage 1 and stage 2 change by about 0.1 s at most.
+
 ## Backlog (ordered by expected gain)
 
-1. Stage 2 person lookups (0.33 s): an in-cache filter of linked IDs in front of the 32 MB map would skip most cache misses.
-2. Stage 3 tiny sorts (0.3 s): sort by ts alone when a group holds one person.
-3. Stage 1 field parsing (0.6 s) and record pushes (0.5 s).
+1. Stage 1 field parsing (about 1.3 s single-thread for events): parse both timestamps and both IDs with wider SIMD; skip validating `ingest_ts`, which the rules guarantee is valid F1.
+2. Stage 1 record pushes (0.37 s): write-combining buffers per bucket, or 24-byte records.
 4. Tune bucket counts and range size for 60M; check whether more threads than `NCPU` helps on the scorer.

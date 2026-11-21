@@ -206,24 +206,40 @@ pub fn part_of(k: u64) -> usize {
 }
 
 /// One partition of a PartMap: open addressing on the bits of mix(key) below
-/// the partition bits.
+/// the partition bits, fronted by a small blocked Bloom filter (2 bits in one
+/// u64 word per key) that answers most absent keys without touching the table.
 pub struct Part {
     slots: Vec<[u64; 2]>,
     bits: u32,
+    bloom: Vec<u64>,
+    wmask: usize,
+}
+
+#[inline(always)]
+fn bloom_word(h: u64, wmask: usize) -> usize {
+    ((h >> 12) as usize) & wmask
+}
+#[inline(always)]
+fn bloom_bits(h: u64) -> u64 {
+    (1u64 << (h & 63)) | (1u64 << ((h >> 6) & 63))
 }
 
 impl Part {
     pub fn with_capacity(n: usize) -> Self {
         let cap = (n * 2).next_power_of_two().max(16);
-        Part { slots: vec![[0, 0]; cap], bits: cap.trailing_zeros() }
+        let words = (n / 4).next_power_of_two().max(8);
+        Part { slots: vec![[0, 0]; cap], bits: cap.trailing_zeros(), bloom: vec![0; words], wmask: words - 1 }
     }
     #[inline(always)]
     fn slot(&self, h: u64) -> usize {
         ((h << PB) >> (64 - self.bits)) as usize
     }
     pub fn insert(&mut self, k: u64, v: u64) {
+        let h = mix(k);
+        let w = bloom_word(h, self.wmask);
+        self.bloom[w] |= bloom_bits(h);
         let mask = self.slots.len() - 1;
-        let mut i = self.slot(mix(k));
+        let mut i = self.slot(h);
         loop {
             let s = &mut self.slots[i];
             if s[0] == 0 || s[0] == k {
@@ -232,6 +248,11 @@ impl Part {
             }
             i = (i + 1) & mask;
         }
+    }
+    #[inline(always)]
+    fn maybe(&self, h: u64) -> bool {
+        let b = bloom_bits(h);
+        unsafe { *self.bloom.get_unchecked(bloom_word(h, self.wmask)) & b == b }
     }
 }
 
@@ -246,6 +267,9 @@ impl PartMap {
     pub fn get(&self, k: u64) -> Option<u64> {
         let h = mix(k);
         let part = unsafe { self.parts.get_unchecked((h >> (64 - PB)) as usize) };
+        if !part.maybe(h) {
+            return None;
+        }
         let mask = part.slots.len() - 1;
         let mut i = part.slot(h);
         loop {
@@ -259,11 +283,14 @@ impl PartMap {
             i = (i + 1) & mask;
         }
     }
+    /// Prefetch the table slot of `k`, unless the filter already rules it out.
     #[inline(always)]
     pub fn prefetch(&self, k: u64) {
         let h = mix(k);
         let part = unsafe { self.parts.get_unchecked((h >> (64 - PB)) as usize) };
-        prefetch(unsafe { part.slots.as_ptr().add(part.slot(h)) });
+        if part.maybe(h) {
+            prefetch(unsafe { part.slots.as_ptr().add(part.slot(h)) });
+        }
     }
 }
 
