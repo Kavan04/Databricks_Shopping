@@ -10,6 +10,7 @@
 //!   D. stage3 : per person bucket: radix-scatter into tiny groups, sort those,
 //!               sessionize, credit + assists, aggregate
 //!   E. output : parquet, one user_daily file per worker
+mod diag;
 mod keys;
 mod links;
 mod mem;
@@ -679,14 +680,6 @@ fn log2_ceil(x: usize) -> u32 {
     x.max(1).next_power_of_two().trailing_zeros()
 }
 
-/// user + system CPU seconds used by the process so far
-fn cpu_secs() -> f64 {
-    let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
-    unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut ru) };
-    let t = |v: libc::timeval| v.tv_sec as f64 + v.tv_usec as f64 * 1e-6;
-    t(ru.ru_utime) + t(ru.ru_stime)
-}
-
 /// Open every CSV of `dir` and cut it into `chunk`-byte ranges of kind `kind`.
 fn add_files(dir: &Path, kind: u8, chunk: usize, files: &mut Vec<InFile>, tasks: &mut Vec<RTask>) -> usize {
     let mut bytes = 0;
@@ -758,8 +751,6 @@ fn bench(ctx: &Ctx, files: &[InFile], tasks: &[RTask]) {
 }
 
 fn main() {
-    let t0 = Instant::now();
-    let lap = |what: &str| eprintln!("[{:7.3}s] {} cpu={:.3}", t0.elapsed().as_secs_f64(), what, cpu_secs());
     let data_dir = PathBuf::from(std::env::var("DATA_DIR").unwrap_or("/data".into()));
     let out_dir = PathBuf::from(std::env::var("OUTPUT_DIR").unwrap_or("/output".into()));
     let nt: usize = std::env::var("NCPU")
@@ -771,6 +762,23 @@ fn main() {
     if let Some(v) = std::env::var("FM_LAHEAD").ok().and_then(|v| v.parse().ok()) {
         LAHEAD.store(v, Relaxed);
     }
+    if std::env::var_os("FM_DIAG").is_some() {
+        // diagnostics for the scoring machine; never a real run
+        diag::main(&data_dir, nt, &|d: &Path, o: &Path, n: usize| run(d, o, n, CHUNK));
+        std::process::exit(1);
+    }
+    run(&data_dir, &out_dir, nt, chunk);
+    // skip destructors: the kernel reclaims everything at exit anyway
+    std::process::exit(0);
+}
+
+/// The whole pipeline: `data_dir` in, both tables written under `out_dir`.
+fn run(data_dir: &Path, out_dir: &Path, nt: usize, chunk: usize) {
+    let t0 = Instant::now();
+    let lap = |what: &str| {
+        let (u, s) = diag::rusage();
+        eprintln!("[{:7.3}s] {} cpu={:.3} user={:.3} sys={:.3}", t0.elapsed().as_secs_f64(), what, u + s, u, s)
+    };
 
     let manifest = std::fs::read_to_string(data_dir.join("manifest.json")).expect("manifest.json");
     let ws = parse_ts(json_str(&manifest, "window_start").as_bytes()).expect("window_start");
@@ -894,6 +902,4 @@ fn main() {
     write_campaign(&out_dir.join("campaign_daily").join("part-0.parquet"), &crows);
     lap("written");
     eprintln!("user rows {} campaign rows {}", total, crows.len());
-    // skip destructors: the kernel reclaims everything at exit anyway
-    std::process::exit(0);
 }
