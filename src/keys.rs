@@ -9,25 +9,6 @@ use xxhash_rust::xxh3::xxh3_64;
 /// Set on keys that are hashes of a string the exact packing cannot hold.
 pub const TAG: u64 = 1 << 63;
 
-#[allow(dead_code)]
-const fn build_code() -> [u8; 256] {
-    let mut t = [0u8; 256];
-    let mut i = 0;
-    while i < 10 {
-        t[b'0' as usize + i] = 1 + i as u8;
-        i += 1;
-    }
-    let mut j = 0;
-    while j < 26 {
-        t[b'a' as usize + j] = 11 + j as u8;
-        j += 1;
-    }
-    t
-}
-#[allow(dead_code)]
-static CODE: [u8; 256] = build_code();
-const DECODE: &[u8; 37] = b"\x000123456789abcdefghijklmnopqrstuvwxyz";
-
 #[inline(always)]
 pub fn h64(b: &[u8]) -> u64 {
     xxh3_64(b)
@@ -38,27 +19,22 @@ fn tagged(f: &[u8]) -> u64 {
     TAG | (h64(f) >> 1)
 }
 
-/// Exact, order-preserving 60-bit key for IDs of 1..=10 chars in [0-9a-z]
-/// (every ID the generator writes before dirt is applied). Anything else gets
-/// TAG | hash; such strings are rare and kept in a side table when needed.
+/// Key of an ID that should start with the letter `prefix` (generator IDs are
+/// `e`, `u` or `k` followed by at most 8 base-36 characters). If the ID is the
+/// prefix plus 1..=8 ASCII bytes, none of them NUL, the key is those bytes read
+/// big-endian: exact, never 0, top bit clear, and integer order equals byte
+/// order among IDs with the same prefix. Anything else gets TAG | hash; such IDs
+/// are rare and their bytes are kept in a side table when needed.
 /// Reference version: safe on any slice.
 #[allow(dead_code)]
-#[inline(always)]
-pub fn id_key(f: &[u8]) -> u64 {
+pub fn pkey(f: &[u8], prefix: u8) -> u64 {
     let n = f.len();
-    if (1..=10).contains(&n) {
-        let mut k = 0u64;
-        let mut good = true;
-        for &b in f {
-            let c = CODE[b as usize];
-            good &= c != 0;
-            k = (k << 6) | c as u64;
-        }
-        if good {
-            return k << (6 * (10 - n));
-        }
+    if n < 2 || n > 9 || f[0] != prefix || f[1..].iter().any(|&b| b == 0 || b >= 0x80) {
+        return tagged(f);
     }
-    tagged(f)
+    let mut w = [0u8; 8];
+    w[..n - 1].copy_from_slice(&f[1..]);
+    u64::from_be_bytes(w)
 }
 
 #[inline(always)]
@@ -69,43 +45,32 @@ unsafe fn ld8(p: *const u8) -> u64 {
 const ONES: u64 = 0x0101_0101_0101_0101;
 const HIGH: u64 = 0x8080_8080_8080_8080;
 
-/// 0x80 in every byte of `x` that lies in [lo, hi]. Every byte of x must be < 0x80.
+/// `pkey` with one unaligned load. Needs 9 readable bytes from the field start.
 #[inline(always)]
-fn in_range(x: u64, lo: u8, hi: u8) -> u64 {
-    let ge = (x | HIGH).wrapping_sub(ONES * lo as u64);
-    let le = (ONES * (0x80 + hi as u64)).wrapping_sub(x);
-    ge & le & HIGH
+pub fn pkey_p(f: &[u8], prefix: u8) -> u64 {
+    let n = f.len();
+    if n < 2 || n > 9 || f[0] != prefix {
+        return tagged(f);
+    }
+    let m = u64::MAX >> (8 * (9 - n)); // the n-1 bytes after the prefix
+    let w = unsafe { ld8(f.as_ptr().add(1)) } & m;
+    // bytes past the ID become 0xFF so only real NULs count as zero bytes
+    let z = w | !m;
+    if (w & HIGH) != 0 || (z.wrapping_sub(ONES) & !z & HIGH) != 0 {
+        return tagged(f);
+    }
+    w.swap_bytes()
 }
 
-/// `id_key` with SWAR: classify and convert 8 bytes at a time, then pack the
-/// 6-bit codes with shifts. Needs 16 readable bytes from the field start.
-#[inline(always)]
-pub fn id_key_p(f: &[u8]) -> u64 {
-    let n = f.len();
-    if n == 0 || n > 10 {
-        return tagged(f);
+/// Append the ID a packed key stands for.
+pub fn decode_pkey(k: u64, prefix: u8, out: &mut Vec<u8>) {
+    out.push(prefix);
+    for b in k.to_be_bytes() {
+        if b == 0 {
+            break;
+        }
+        out.push(b);
     }
-    let p = f.as_ptr();
-    let (w0, w1) = unsafe { (ld8(p), ld8(p.add(8)) & 0xFFFF) };
-    let m0 = if n >= 8 { u64::MAX } else { (1u64 << (8 * n)) - 1 };
-    let m1 = if n <= 8 { 0 } else { (1u64 << (8 * (n - 8))) - 1 };
-    let (x0, x1) = (w0 & m0, w1 & m1);
-    if (x0 | x1) & HIGH != 0 {
-        return tagged(f);
-    }
-    let (d0, l0) = (in_range(x0, b'0', b'9'), in_range(x0, b'a', b'z'));
-    let (d1, l1) = (in_range(x1, b'0', b'9'), in_range(x1, b'a', b'z'));
-    if ((d0 | l0) >> 7) != (m0 & ONES) || ((d1 | l1) >> 7) != (m1 & ONES) {
-        return tagged(f);
-    }
-    let c0 = x0 - ((d0 >> 7) * 0x2F + (l0 >> 7) * 0x56);
-    let c1 = x1 - ((d1 >> 7) * 0x2F + (l1 >> 7) * 0x56);
-    let y = c0.swap_bytes();
-    let y = ((y & 0x3F00_3F00_3F00_3F00) >> 2) | (y & 0x003F_003F_003F_003F);
-    let y = ((y & 0x0FFF_0000_0FFF_0000) >> 4) | (y & 0x0000_0FFF_0000_0FFF);
-    let y = ((y & 0x00FF_FFFF_0000_0000) >> 8) | (y & 0x0000_0000_00FF_FFFF);
-    let z = ((c1 & 0x3F) << 6) | ((c1 >> 8) & 0x3F);
-    (y << 12) | z
 }
 
 #[inline(always)]
@@ -113,15 +78,6 @@ pub fn is_packed(k: u64) -> bool {
     k & TAG == 0
 }
 
-pub fn decode_key(k: u64, out: &mut Vec<u8>) {
-    for i in 0..10 {
-        let c = (k >> (54 - 6 * i)) & 63;
-        if c == 0 {
-            break;
-        }
-        out.push(DECODE[c as usize]);
-    }
-}
 
 /// Strong 64-bit finalizer for spreading keys over buckets and table slots.
 #[inline(always)]
@@ -578,31 +534,47 @@ mod tests {
     }
 
     #[test]
-    fn id_key_fast_matches_reference() {
-        let alphabet: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyzABZ /:`{@\"\x7f\x80\xff-_";
+    fn pkey_fast_matches_reference() {
+        let alphabet: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyzeuk EUK/:`{@\"\x00\x7f\x80\xff-_";
         let mut r = Rng(0x1234_5678_9abc_def1);
         for _ in 0..2_000_000 {
-            let n = r.below(14) as usize;
-            let s: Vec<u8> = (0..n)
+            let n = r.below(12) as usize;
+            let mut s: Vec<u8> = (0..n)
                 .map(|_| if r.below(10) < 8 { b"0123456789abcdefghijklmnopqrstuvwxyz"[r.below(36) as usize] } else { alphabet[r.below(alphabet.len() as u64) as usize] })
                 .collect();
-            for junk in [b'a', b'0', 0u8, b'"', 0xffu8] {
-                let buf = padded(&s, junk);
-                assert_eq!(id_key_p(&buf[..n]), id_key(&s), "{:?}", String::from_utf8_lossy(&s));
+            if n > 0 && r.below(4) != 0 {
+                s[0] = b"euk"[r.below(3) as usize];
+            }
+            for prefix in [b'e', b'u', b'k'] {
+                for junk in [b'a', b'0', 0u8, b'"', 0xffu8] {
+                    let buf = padded(&s, junk);
+                    assert_eq!(pkey_p(&buf[..n], prefix), pkey(&s, prefix), "{:?}", String::from_utf8_lossy(&s));
+                }
             }
         }
     }
 
     #[test]
-    fn packed_keys_keep_byte_order() {
+    fn packed_keys_keep_byte_order_and_decode() {
         let mut r = Rng(99);
-        for _ in 0..200_000 {
-            let mk = |r: &mut Rng| -> Vec<u8> { (0..1 + r.below(10)).map(|_| b"0123456789abcdefghijklmnopqrstuvwxyz"[r.below(36) as usize]).collect() };
+        let mk = |r: &mut Rng| -> Vec<u8> {
+            let mut v = vec![b'u'];
+            v.extend((0..1 + r.below(8)).map(|_| b"0123456789abcdefghijklmnopqrstuvwxyz"[r.below(36) as usize]));
+            v
+        };
+        for _ in 0..500_000 {
             let (a, b) = (mk(&mut r), mk(&mut r));
-            assert_eq!(id_key(&a) < id_key(&b), a < b);
+            let (ka, kb) = (pkey(&a, b'u'), pkey(&b, b'u'));
+            assert!(is_packed(ka) && ka != 0);
+            assert_eq!(ka < kb, a < b);
+            assert_eq!(ka == kb, a == b);
             let mut d = Vec::new();
-            decode_key(id_key(&a), &mut d);
+            decode_pkey(ka, b'u', &mut d);
             assert_eq!(d, a);
+        }
+        // not packed: wrong prefix, too long, too short, NUL, non-ASCII
+        for s in [&b"U1"[..], b"u123456789", b"u", b"x12", b"u1\x00", b"u\xc3\xa9", b""] {
+            assert!(!is_packed(pkey(s, b'u')), "{:?}", s);
         }
     }
 

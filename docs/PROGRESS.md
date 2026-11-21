@@ -10,7 +10,8 @@ Goal: the top of the Shopping Sessions leaderboard. At the time of the first sub
 | v2 | `88d363d` | not submitted | 0.93 s | 36/36 fixtures + dev MATCH on arm64 and amd64 (AVX2); 20M identical to v1 |
 | v2.1 | `451a10f` | not submitted | ~13% faster than v2 in an interleaved A/B | same, plus dev MATCH with 997-byte and 64-byte chunks (boundary stress) |
 | v3 | `2402180` | not submitted | **0.80 s** (v2.1: 1.04 s) | unit tests (fast parsers and scanner vs reference), 36/36 fixtures, dev MATCH, boundary stress, on arm64 and amd64; 20M identical to v1 |
-| v3.1 | see git log | not submitted yet | **0.77 s** (v3 in the same A/B: 0.84 s) | unit tests, 36/36 fixtures + dev MATCH on arm64 and amd64; 20M identical to v1 |
+| v3.1 | `42e0506` | not submitted | **0.77 s** (v3 in the same A/B: 0.84 s) | unit tests, 36/36 fixtures + dev MATCH on arm64 and amd64; 20M identical to v1 |
+| v3.2 | see git log | not submitted yet | single-thread work 3.73 s vs 4.14 s for v3.1 (interleaved, min of 6) | unit tests, fixtures, dev (also 997 / 64-byte ranges) on arm64 and amd64; 20M identical to v1 |
 
 Local timings come from a Docker VM on an 8-core Apple-silicon Mac, with the data in `/dev/shm`. The Mac is often loaded, so one run can vary 2 to 3x. Only best-of-N is meaningful, and only the board counts.
 
@@ -161,8 +162,38 @@ Measured single-thread splits behind these choices (minimum of 7 runs, 20M):
 
 So bucket pushes, which write fresh memory, cost about 0.37 s of single-thread work. Pre-faulting the input changes nothing. With 256, 1024 or 4096 event buckets, stage 1 and stage 2 change by about 0.1 s at most.
 
+## v3.1 -> v3.2
+
+A steady single-thread microbenchmark (`BENCH=1`) runs each parsing layer over one warm 256 MB event file, best of 5, and varies by about 3% between runs. It replaced end-to-end timings for tuning:
+
+| Layer, per event line | v3.1 | v3.2 |
+| --- | --- | --- |
+| SIMD scan + field split | 21.9 ns | 21.9 ns |
+| + both ID keys | +12.6 ns | +6.3 ns |
+| + both timestamps | +15.2 ns | +15.2 ns |
+| all of `parse_event` | 48.9 ns | 42.4 ns |
+| + push into 1024 buckets | +14 ns | +9 to 10 ns |
+
+* **ID keys:** generator IDs are one known letter plus at most 8 ASCII bytes, so those bytes, big-endian, are an exact key that also sorts in byte order. That takes one load and a few checks, against 6-bit packing. Anything else still gets the hashed key.
+* **Push:** pushing into many buckets missed the cache on almost every store. With 64 buckets the push is 5.5 ns; with 4096 it is 20 to 29 ns, the same with fresh or recycled memory. Software write-combining fixes this. Each bucket fills one cache line in a small buffer, and full lines are written with non-temporal stores (`vmovntdq` on the scorer, `stnp` on ARM). This applies to stage 1 events and stage 2 output.
+* **Day numbers:** a division per session was replaced by a precomputed day offset.
+
+Instruction-level profile (`perf annotate`, single thread) after these changes:
+* About 40% of the scan loop is the 64-byte input loads: streaming the input from memory.
+* The kernel zeroing fresh pages (`dc zva`) is about 10% of all work.
+* Stage 2 waits on person lookups and on the dedup table.
+
+Tried and dropped (single-thread minimums, 4 runs each):
+
+| Idea | Result |
+| --- | --- |
+| Software prefetch 512 B to 4 KB ahead in the scanner | slower: stage 1 2.2 s vs 1.96 s without |
+| Prefetch dedup table slots and the record stream 8 ahead | no change |
+| Person-lookup prefetch distance 8 / 16 / 32 / 64 | no change (kept 32) |
+
 ## Backlog (ordered by expected gain)
 
-1. Stage 1 field parsing (about 1.3 s single-thread for events): parse both timestamps and both IDs with wider SIMD; skip validating `ingest_ts`, which the rules guarantee is valid F1.
-2. Stage 1 record pushes (0.37 s): write-combining buffers per bucket, or 24-byte records.
+1. 16-byte dedup records instead of 32: take the bucket from the eid's own bits, store a 17-bit `ingest - ts` instead of `ingest`, keep purchase price and category in a side stream. This halves stage 1 writes, stage 2 reads and kernel page zeroing.
+2. Timestamps (15 ns per line): wider SIMD for the fixed F1 layout.
+3. Calibrate everything against a real board score: local runs mix performance and efficiency cores and a loaded host.
 4. Tune bucket counts and range size for 60M; check whether more threads than `NCPU` helps on the scorer.

@@ -86,13 +86,13 @@ Any quote that is not the first or last byte of a field breaks the count, so the
 
 ## 4. Keys instead of strings
 
-Generator IDs are a letter plus base 36: `u8nj7nrj5`, `e42huhoug`, `k9pbmgz1e`. `id_key_p` packs any 1 to 10 characters from `[0-9a-z]` into an exact 60-bit integer, 6 bits per character and left-aligned, so integer order equals byte order. It works 8 bytes at a time (SWAR range checks, then shifts that squeeze the 6-bit codes together).
+Generator IDs are one letter plus at most 8 base-36 characters: `u8nj7nrj5`, `e42huhoug`, `k9pbmgz1e`. `pkey_p(field, letter)` checks the expected letter (`e` for events, `u` for users, `k` for clicks), loads the next 8 bytes once, masks them to the ID's length, and byte-swaps them. The result is the key: exact, never 0, top bit clear, and among IDs with the same letter integer order equals byte order.
 
 ```mermaid
 flowchart TD
-    S["field bytes (unquoted)"] --> Q{"1..10 chars,<br/>all in [0-9a-z]?"}
-    Q -->|"yes (almost always)"| PK["packed key: exact, order-preserving, top bit 0"]
-    Q -->|"no: upper case, spaces, long"| HK["TAG | xxh3(bytes)&gt;&gt;1, top bit 1"]
+    S["field bytes (unquoted)"] --> Q{"expected letter + 1..8 bytes,<br/>all ASCII, no NUL?"}
+    Q -->|"yes (almost always)"| PK["packed key = following bytes, big-endian<br/>exact, order-preserving, top bit 0"]
+    Q -->|"no: upper case, spaces, long, other"| HK["TAG | xxh3(bytes)&gt;&gt;1, top bit 1"]
     HK --> NT["string kept in a side table<br/>(names, click_id ties)"]
 ```
 
@@ -146,6 +146,8 @@ Record layouts:
 `ts_rel` is measured from `window_start - 7 days`, so events and clicks share one 31-bit clock.
 
 Clicks are parsed into a small per-range buffer first. Their person lookups then run with prefetches issued 16 clicks ahead.
+
+Records go into 1024 event_id buckets through **write-combining** buffers (`mem::WcBuckets`). Each bucket fills one 64-byte line in a small hot buffer (2 events of 32 B, or 4 stage-2 outputs of 16 B), and full lines go to the bucket's block with non-temporal stores. Scattering straight into a thousand buckets missed the cache on nearly every store; the push cost per line roughly tracks the number of buckets (5.5 ns at 64, about 15 ns at 1024, 20 to 29 ns at 4096).
 
 ## 7. Stage C: dedup
 

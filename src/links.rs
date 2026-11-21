@@ -111,8 +111,8 @@ pub fn build(files: &[InFile], tasks: &[RTask], nt: usize) -> LinkTable {
                         let data = lines_in(&files[t.file], t.off, t.len);
                         for_each_record::<2>(data, |f| {
                             if !f[0].is_empty() && !f[1].is_empty() {
-                                let a = id_key_p(f[0]);
-                                let b = id_key_p(f[1]);
+                                let a = pkey_p(f[0], b'u');
+                                let b = pkey_p(f[1], b'u');
                                 if !is_packed(a) {
                                     strs.push((a, f[0].to_vec()));
                                 }
@@ -194,7 +194,7 @@ pub fn build(files: &[InFile], tasks: &[RTask], nt: usize) -> LinkTable {
     let bytes_of = |k: u64| -> Vec<u8> {
         if is_packed(k) {
             let mut v = Vec::new();
-            decode_key(k, &mut v);
+            decode_pkey(k, b'u', &mut v);
             v
         } else {
             strmap[&k].clone()

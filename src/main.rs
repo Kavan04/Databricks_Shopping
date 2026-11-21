@@ -54,7 +54,7 @@ struct E1 {
 }
 
 /// Surviving event, keyed by its person.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 #[repr(C)]
 struct Ev {
     person: u64,
@@ -77,6 +77,9 @@ struct Ctx {
     base: i64,
     day0: i64,
     ndays: usize,
+    /// base split into whole days and the remainder, for cheap day numbers
+    base_day: i64,
+    base_off: i64,
     camps: U64Map,
     ncamp: usize,
     prods: U64Map,
@@ -114,7 +117,7 @@ fn parse_event(ctx: &Ctx, f: &[&[u8]; 7], dc: &mut DateCache, strs: &mut Vec<(u6
     if f[0].is_empty() {
         return None;
     }
-    let eid = id_key_p(f[0]);
+    let eid = pkey_p(f[0], b'e');
     let ing = ts_p(f[3], dc).unwrap_or(i64::MAX);
     let ingc = (ing.clamp(-(1 << 47), (1 << 47) - 1) + (1 << 47)) as u64;
     let bad = E1 { eid, user: 0, w2: 0, ing: ingc << 1 };
@@ -151,7 +154,7 @@ fn parse_event(ctx: &Ctx, f: &[&[u8]; 7], dc: &mut DateCache, strs: &mut Vec<(u6
             None => return Some(bad),
         }
     }
-    let user = id_key_p(f[1]);
+    let user = pkey_p(f[1], b'u');
     if !is_packed(user) {
         strs.push((user, f[1].to_vec()));
     }
@@ -169,14 +172,16 @@ fn parse_click(ctx: &Ctx, f: &[&[u8]; 4], dc: &mut DateCache, strs: &mut Vec<(u6
         return None;
     }
     let camp = ctx.camps.get(skey(f[2]))?;
-    let ckey = id_key_p(f[0]);
+    let ckey = pkey_p(f[0], b'k');
     if !is_packed(ckey) {
         strs.push((ckey, f[0].to_vec()));
     }
-    Some(Ck { person: id_key_p(f[1]), w1: (((t - ctx.base) as u64) << 24) | camp, ckey })
+    Some(Ck { person: pkey_p(f[1], b'u'), w1: (((t - ctx.base) as u64) << 24) | camp, ckey })
 }
 
 const AHEAD: usize = 16;
+/// Lookahead of stage 2's person lookups.
+static LAHEAD: AtomicUsize = AtomicUsize::new(32);
 
 fn stage1(ctx: &Ctx, arena: &Arena, files: &[InFile], tasks: &[RTask], nt: usize, lt: &LinkTable) -> Vec<S1> {
     let next = AtomicUsize::new(0);
@@ -186,7 +191,7 @@ fn stage1(ctx: &Ctx, arena: &Arena, files: &[InFile], tasks: &[RTask], nt: usize
             .map(|_| {
                 s.spawn(|| {
                     let mut blocks = Blocks::new(arena);
-                    let mut ev: Vec<Bkt<E1>> = (0..nb1).map(|_| Bkt::new()).collect();
+                    let mut ev: WcBuckets<E1, 2> = WcBuckets::new(nb1);
                     let mut ck: Vec<Bkt<Ck>> = (0..nb2).map(|_| Bkt::new()).collect();
                     let mut strs = Vec::new();
                     let mut dc = DateCache::new();
@@ -204,7 +209,7 @@ fn stage1(ctx: &Ctx, arena: &Arena, files: &[InFile], tasks: &[RTask], nt: usize
                         if t.kind == 0 {
                             for_each_record::<7>(data, |f| {
                                 if let Some(e) = parse_event(ctx, f, &mut dc, &mut strs) {
-                                    ev[bucket(e.eid, ctx.b1bits)].push(e, &mut blocks);
+                                    ev.push(bucket(e.eid, ctx.b1bits), e, &mut blocks);
                                 }
                             });
                         } else {
@@ -225,7 +230,7 @@ fn stage1(ctx: &Ctx, arena: &Arena, files: &[InFile], tasks: &[RTask], nt: usize
                         }
                     }
                     S1 {
-                        ev: ev.into_iter().map(|b| b.finish()).collect(),
+                        ev: ev.finish(&mut blocks),
                         ck: ck.into_iter().map(|b| b.finish()).collect(),
                         strs,
                     }
@@ -248,7 +253,7 @@ fn stage2(ctx: &Ctx, s1: &[S1], lt: &LinkTable, arena: &Arena, nt: usize) -> Vec
             .map(|_| {
                 s.spawn(|| {
                     let mut blocks = Blocks::new(arena);
-                    let mut out: Vec<Bkt<Ev>> = (0..nb2).map(|_| Bkt::new()).collect();
+                    let mut out: WcBuckets<Ev, 4> = WcBuckets::new(nb2);
                     let mut table: Vec<E1> = Vec::new();
                     let mut surv: Vec<(u64, u64)> = Vec::new();
                     loop {
@@ -265,10 +270,12 @@ fn stage2(ctx: &Ctx, s1: &[S1], lt: &LinkTable, arena: &Arena, nt: usize) -> Vec
                         let mask = cap - 1;
                         table.clear();
                         table.resize(cap, E1::default());
+                        let slot = |eid: u64| ((mix(eid) << b1bits) >> (64 - tbits)) as usize;
                         for w in s1 {
                             for sg in &w.ev[b] {
-                                for r in sg.slice() {
-                                    let mut i = ((mix(r.eid) << b1bits) >> (64 - tbits)) as usize;
+                                let recs = sg.slice();
+                                for r in recs {
+                                    let mut i = slot(r.eid);
                                     loop {
                                         let t = unsafe { table.get_unchecked_mut(i) };
                                         if t.eid == 0 {
@@ -296,16 +303,17 @@ fn stage2(ctx: &Ctx, s1: &[S1], lt: &LinkTable, arena: &Arena, nt: usize) -> Vec
                                 surv.push((t.user, t.w2));
                             }
                         }
+                        let ahead = LAHEAD.load(Relaxed);
                         for j in 0..surv.len() {
-                            if j + AHEAD < surv.len() {
-                                lt.map.prefetch(surv[j + AHEAD].0);
+                            if j + ahead < surv.len() {
+                                lt.map.prefetch(surv[j + ahead].0);
                             }
                             let (u, w2) = surv[j];
                             let p = lt.resolve(u);
-                            out[bucket(p, ctx.b2bits)].push(Ev { person: p, w2 }, &mut blocks);
+                            out.push(bucket(p, ctx.b2bits), Ev { person: p, w2 }, &mut blocks);
                         }
                     }
-                    out.into_iter().map(|b| b.finish()).collect::<Vec<_>>()
+                    out.finish(&mut blocks)
                 })
             })
             .collect();
@@ -360,9 +368,10 @@ fn ck_camp(c: &Ck) -> usize {
 
 type Names = HashMap<u64, Vec<u8>>;
 
-fn name_of(k: u64, names: &Names, out: &mut Vec<u8>) {
+/// Append the ID that key `k` stands for (`prefix` is the ID kind's letter).
+fn name_of(k: u64, prefix: u8, names: &Names, out: &mut Vec<u8>) {
     if is_packed(k) {
-        decode_key(k, out);
+        decode_pkey(k, prefix, out);
     } else {
         out.extend_from_slice(names.get(&k).expect("name for hashed key"));
     }
@@ -374,8 +383,8 @@ fn key_less(a: u64, b: u64, names: &Names) -> bool {
         return a < b;
     }
     let (mut x, mut y) = (Vec::new(), Vec::new());
-    name_of(a, names, &mut x);
-    name_of(b, names, &mut y);
+    name_of(a, b'k', names, &mut x);
+    name_of(b, b'k', names, &mut y);
     x < y
 }
 
@@ -421,7 +430,7 @@ fn person_proc(w: &mut W3, ctx: &Ctx, names: &Names, evs: &[Ev], cks: &[Ck]) {
             np += (price > 0) as u32;
             j += 1;
         }
-        let day = (ctx.base + start).div_euclid(DAY);
+        let day = ctx.base_day + ((ctx.base_off + start) as u64 / DAY as u64) as i64;
         if day != cur_day {
             if cur_day != i64::MIN {
                 flush_day(w, person, cur_day, d_s, d_e, d_r);
@@ -627,7 +636,7 @@ fn stage3(ctx: &Ctx, names: &Names, s1: &[S1], s2: &[Vec<Vec<Seg<Ev>>>], nt: usi
                         }
                     }
                     if !w.urows.is_empty() {
-                        let name = |k: u64, buf: &mut Vec<u8>| name_of(k, names, buf);
+                        let name = |k: u64, buf: &mut Vec<u8>| name_of(k, b'u', names, buf);
                         write_user(&out_dir.join("user_daily").join(format!("part-{}.parquet", wi)), &w.urows, cats, &name);
                     }
                     w
@@ -693,6 +702,57 @@ fn add_files(dir: &Path, kind: u8, chunk: usize, files: &mut Vec<InFile>, tasks:
     bytes
 }
 
+/// BENCH=1: single-thread throughput of each parsing layer on the largest
+/// event file (warm, best of 5). A measuring tool, not part of a run.
+fn bench(ctx: &Ctx, files: &[InFile], tasks: &[RTask]) {
+    let fi = (0..files.len()).filter(|&i| tasks.iter().any(|t| t.file == i && t.kind == 0)).max_by_key(|&i| files[i].size).unwrap();
+    let d = lines_in(&files[fi], 0, files[fi].size);
+    let d = &d[..d.len().min(256 << 20)];
+    let d = &d[..memchr::memrchr(b'\n', d).unwrap()];
+    let lines = memchr::memchr_iter(b'\n', d).count() + 1;
+    let arena = Arena::new();
+    let mut warm = Blocks::new(&arena);
+    let mut res = Vec::new();
+    for mode in 0..7 {
+        let mut best = f64::MAX;
+        for _ in 0..5 {
+            let mut dc = DateCache::new();
+            let mut strs = Vec::new();
+            let mut blocks = Blocks::new(&arena);
+            let bb: u32 = std::env::var("BENCH_B1").ok().and_then(|v| v.parse().ok()).unwrap_or(ctx.b1bits);
+            let mut ev: WcBuckets<E1, 2> = WcBuckets::new(1usize << bb);
+            let wb = if mode == 6 { &mut warm } else { &mut blocks };
+            let t = Instant::now();
+            let mut acc = 0u64;
+            match mode {
+                0 => acc = memchr::memchr_iter(b'\n', d).count() as u64,
+                1 => for_each_record::<7>(d, |f| acc = acc.wrapping_add(f[2].len() as u64)),
+                2 => for_each_record::<7>(d, |f| acc = acc.wrapping_add(pkey_p(f[0], b'e') ^ pkey_p(f[1], b'u'))),
+                3 => for_each_record::<7>(d, |f| acc = acc.wrapping_add((ts_p(f[2], &mut dc).unwrap_or(0) ^ ts_p(f[3], &mut dc).unwrap_or(0)) as u64)),
+                4 => for_each_record::<7>(d, |f| {
+                    if let Some(e) = parse_event(ctx, f, &mut dc, &mut strs) {
+                        acc = acc.wrapping_add(e.eid ^ e.w2 ^ e.ing ^ e.user);
+                    }
+                }),
+                _ => for_each_record::<7>(d, |f| {
+                    if let Some(e) = parse_event(ctx, f, &mut dc, &mut strs) {
+                        ev.push(bucket(e.eid, bb), e, wb);
+                    }
+                }),
+            }
+            std::hint::black_box(acc);
+            best = best.min(t.elapsed().as_secs_f64());
+            if mode == 6 {
+                for segs in ev.finish(&mut warm) {
+                    warm.recycle(&segs);
+                }
+            }
+        }
+        res.push(format!("{}: {:.0} MB/s {:.1} ns/line", ["memchr-nl", "records", "+2 keys", "+2 ts", "parse_event", "+push (fresh memory)", "+push (recycled memory)"][mode], d.len() as f64 / best / 1e6, best * 1e9 / lines as f64));
+    }
+    eprintln!("bench on {} MB, {} lines:\n  {}", d.len() >> 20, lines, res.join("\n  "));
+}
+
 fn main() {
     let t0 = Instant::now();
     let lap = |what: &str| eprintln!("[{:7.3}s] {} cpu={:.3}", t0.elapsed().as_secs_f64(), what, cpu_secs());
@@ -704,6 +764,9 @@ fn main() {
         .unwrap_or_else(|| thread::available_parallelism().map(|n| n.get()).unwrap_or(4))
         .max(1);
     let chunk: usize = std::env::var("FM_CHUNK").ok().and_then(|v| v.parse().ok()).unwrap_or(CHUNK).max(1);
+    if let Some(v) = std::env::var("FM_LAHEAD").ok().and_then(|v| v.parse().ok()) {
+        LAHEAD.store(v, Relaxed);
+    }
 
     let manifest = std::fs::read_to_string(data_dir.join("manifest.json")).expect("manifest.json");
     let ws = parse_ts(json_str(&manifest, "window_start").as_bytes()).expect("window_start");
@@ -769,7 +832,12 @@ fn main() {
     let lt = links::build(&files, &lk_tasks, nt);
     lap("links");
 
-    let ctx = Ctx { ws, we, base, day0, ndays, camps, ncamp, prods, unknown_cat, b1bits, b2bits };
+    let (base_day, base_off) = (base.div_euclid(DAY), base.rem_euclid(DAY));
+    let ctx = Ctx { ws, we, base, day0, ndays, base_day, base_off, camps, ncamp, prods, unknown_cat, b1bits, b2bits };
+    if std::env::var_os("BENCH").is_some() {
+        bench(&ctx, &files, &tasks);
+        return;
+    }
     let arena = Arena::new();
     let s1 = stage1(&ctx, &arena, &files, &tasks, nt, &lt);
     lap("stage1 parse");
@@ -813,7 +881,7 @@ fn main() {
 
     let total: usize = w3.iter().map(|w| w.urows.len()).sum();
     if total == 0 {
-        let name = |k: u64, buf: &mut Vec<u8>| name_of(k, &names, buf);
+        let name = |k: u64, buf: &mut Vec<u8>| name_of(k, b'u', &names, buf);
         write_user(&out_dir.join("user_daily").join("part-0.parquet"), &[], &cat_refs, &name);
     }
     write_campaign(&out_dir.join("campaign_daily").join("part-0.parquet"), &crows);
