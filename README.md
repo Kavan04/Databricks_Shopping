@@ -1,6 +1,6 @@
 # Shopping Sessions: Rust pipeline
 
-Single static-ish Rust binary (`src/main.rs`), implementing `rules.md` exactly.
+Single Rust binary implementing `rules.md` exactly. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the data flow (with diagrams) and [docs/PROGRESS.md](docs/PROGRESS.md) for scores and experiments.
 
 Pipeline: mmap every CSV in newline-aligned 8 MB chunks, then
 1. links: parse, union-find over 64-bit xxh3 hashes, person key = hash of the byte-wise smallest id
