@@ -8,7 +8,8 @@ Goal: the top of the Shopping Sessions leaderboard. At the time of the first sub
 | --- | --- | --- | --- | --- |
 | v1 | `4a02f9d` | **1.95 s** | 1.80 s | 36/36 fixtures, dev MATCH |
 | v2 | `88d363d` | not submitted | 0.93 s | 36/36 fixtures + dev MATCH on arm64 and amd64 (AVX2); 20M identical to v1 |
-| v2.1 | see git log | not submitted yet | ~13% faster than v2 in an interleaved A/B | same, plus dev MATCH with 997-byte and 64-byte chunks (boundary stress) |
+| v2.1 | `451a10f` | not submitted | ~13% faster than v2 in an interleaved A/B | same, plus dev MATCH with 997-byte and 64-byte chunks (boundary stress) |
+| v3 | see git log | not submitted yet | **0.80 s** (v2.1: 1.04 s) | unit tests (fast parsers and scanner vs reference), 36/36 fixtures, dev MATCH, boundary stress, on arm64 and amd64; 20M identical to v1 |
 
 Local timings come from a Docker VM on an 8-core Apple-silicon Mac, with the data in `/dev/shm`. The Mac is often loaded, so one run can vary 2 to 3x. Only best-of-N is meaningful, and only the board counts.
 
@@ -56,6 +57,61 @@ flowchart LR
     end
 ```
 
+## v3: single-thread cost per stage (20M events, data in RAM)
+
+With one worker, the stages run back to back, so each stage's CPU cost is measurable without the noise of the loaded Mac. 8-thread wall time is roughly this divided by 5, because the Mac has 4 performance and 4 efficiency cores; the scorer's 4 cores with hyperthreading scale similarly.
+
+| Stage | Work | Main costs |
+| --- | --- | --- |
+| A links | 0.16 s | parse, node index, union-find (all parallel in v3) |
+| B parse | 2.2 s | page mapping or copying of input ~0.5, SIMD scan + fields ~0.5, field parsing ~0.6, record pushes (fresh memory) ~0.5, clicks ~0.25 |
+| C dedup | 0.74 s | table 0.31, person lookups 0.33, pushes 0.10 |
+| D sessions | 0.8 s | grouping 0.1, tiny sorts 0.3, session walk 0.4 |
+| E write | 0.2 s | |
+
+```mermaid
+pie title v3 single-thread work (about 4.1 CPU-s on 20M)
+    "B parse" : 2.2
+    "C dedup" : 0.74
+    "D sessions" : 0.8
+    "E write" : 0.2
+    "A links" : 0.16
+```
+
+## v2.1 -> v3
+
+```mermaid
+flowchart LR
+    subgraph v21["v2.1"]
+        a1["links: serial union-find<br/>on a side thread (0.18 s)"]
+        b1["input: pread copy"]
+        c1["fields: branch per quote"]
+        d1["keys, timestamps: byte loops"]
+        e1["clicks: unprefetched lookup"]
+        f1["dedup output: fresh memory"]
+        g1["sessions: gather + pdqsort"]
+        h1["names: one allocation per row"]
+    end
+    subgraph v3["v3"]
+        a2["links: parallel node index +<br/>lock-free union-find (0.05 s)"]
+        b2["input: padded mmap +<br/>POPULATE_READ per range"]
+        c2["fields: branch-free,<br/>quote count check"]
+        d2["keys: SWAR; timestamps:<br/>date cache + SWAR digits"]
+        e2["clicks: prefetched lookup"]
+        f2["dedup output: recycled blocks"]
+        g2["sessions: counting sort into<br/>tiny groups + insertion sort"]
+        h2["names: one buffer per file"]
+    end
+    a1 --> a2
+    b1 --> b2
+    c1 --> c2
+    d1 --> d2
+    e1 --> e2
+    f1 --> f2
+    g1 --> g2
+    h1 --> h2
+```
+
 ## Measurements behind v2.1
 
 Single-thread scanner throughput on memory that is already touched, on one 256 MB event file (best of 5):
@@ -82,12 +138,14 @@ Inside the pipeline, the same field-splitting step ran at about half that speed.
 | Union-find on its own thread | Takes about 0.18 s of serial work off the critical path | yes |
 | 16-byte person records | Halves stage 3 traffic | yes |
 | `pread` ranges into reused buffers instead of `mmap` | ~13% faster end to end in an interleaved A/B; stage 1 no longer pays input page faults | yes |
-| Fast path in field split for quote-free lines | Skips per-field quote checks for most lines | yes |
+| Fast path in field split for quote-free lines | Only 21% of lines have no quote (0.8^7), so little gain | replaced by branch-free check in v3 |
+| v3 parallel links | 4.4 s at first: the per-partition tables took slot bits from the same hash bits as the partition, so keys piled into 1/64 of each table. Fixed by rotating the hash: 55 ms | yes |
+| v3 padded `mmap` + `POPULATE_READ` instead of `pread` | Same single-thread work here (tmpfs), but less memory traffic: best 8-thread run 0.80 s vs 0.97 s | yes |
+| `MAP_POPULATE`, `MADV_HUGEPAGE`, `MADV_NOHUGEPAGE` on the arena | No difference beyond noise (single thread, 3 rounds) | no |
 
 ## Backlog (ordered by expected gain)
 
-1. Stage 1 per-line cost: cheaper timestamp parse (SWAR digit checks), SWAR ID-key packing.
-2. Kernel page-fault cost: reuse stage 1 blocks for stage 2 output, and pre-fault the arena in parallel.
-3. Stage 3: radix sort, or group by a dense person index, instead of comparison sort.
-4. Thread count above `NCPU` to hide page faults; tune bucket counts for 60M.
-5. Parquet: write `user_id` without per-row allocation.
+1. Stage 2 person lookups (0.33 s): an in-cache filter of linked IDs in front of the 32 MB map would skip most cache misses.
+2. Stage 3 tiny sorts (0.3 s): sort by ts alone when a group holds one person.
+3. Stage 1 field parsing (0.6 s) and record pushes (0.5 s).
+4. Tune bucket counts and range size for 60M; check whether more threads than `NCPU` helps on the scorer.

@@ -81,18 +81,20 @@ pub fn write_user(path: &Path, rows: &[URow], cats: &[&[u8]], name: &(dyn Fn(u64
     );
     let p = props(&["top_category"], &["user_id", "day", "sessions", "events", "revenue_cents"]);
     let cat_bytes: Vec<ByteArray> = cats.iter().map(|c| ByteArray::from(c.to_vec())).collect();
+    debug_assert!(cat_bytes.len() == cats.len());
     let mut w = SerializedFileWriter::new(File::create(path).unwrap(), schema, p).unwrap();
     for part in rows.chunks(1 << 20) {
         let mut rg = w.next_row_group().unwrap();
-        let mut buf = Vec::with_capacity(16);
-        let ids: Vec<ByteArray> = part
-            .iter()
-            .map(|r| {
-                buf.clear();
-                name(r.person, &mut buf);
-                ByteArray::from(buf.clone())
-            })
-            .collect();
+        // every name in one buffer; each value is a cheap slice of it
+        let mut buf = Vec::with_capacity(part.len() * 10);
+        let mut offs = Vec::with_capacity(part.len() + 1);
+        for r in part {
+            offs.push(buf.len());
+            name(r.person, &mut buf);
+        }
+        offs.push(buf.len());
+        let all = bytes::Bytes::from(buf);
+        let ids: Vec<ByteArray> = (0..part.len()).map(|i| ByteArray::from(all.slice(offs[i]..offs[i + 1]))).collect();
         col_str(&mut rg, &ids, None);
         col_i32(&mut rg, &part.iter().map(|r| r.day).collect::<Vec<_>>());
         col_i64(&mut rg, &part.iter().map(|r| r.sessions as i64).collect::<Vec<_>>());

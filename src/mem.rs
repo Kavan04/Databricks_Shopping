@@ -1,11 +1,13 @@
 //! Append-only memory: a lock-free bump allocator of 16 KiB blocks and
-//! per-thread buckets built from those blocks. Nothing is freed before exit, so
-//! there is no realloc copying and no mmap/munmap churn while threads scatter.
+//! per-thread buckets built from those blocks. Nothing goes back to the OS
+//! before exit, so there is no realloc copying and no mmap/munmap churn. A
+//! worker that has consumed blocks may recycle them for its own output
+//! (`Blocks::recycle`), which saves the kernel from zeroing fresh pages.
 
 use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering::{Acquire, Relaxed, Release}};
 use std::sync::Mutex;
 
-const BLK: usize = 16 << 10;
+pub const BLK: usize = 16 << 10;
 const SEG_BYTES: usize = 1 << 30;
 const MAX_SEGS: usize = 96;
 
@@ -62,7 +64,32 @@ impl Arena {
     }
 }
 
-/// A finished run of records inside the arena.
+/// A worker's source of blocks: recycled ones first, then fresh arena blocks.
+pub struct Blocks<'a> {
+    arena: &'a Arena,
+    free: Vec<*mut u8>,
+}
+
+impl<'a> Blocks<'a> {
+    pub fn new(arena: &'a Arena) -> Self {
+        Blocks { arena, free: Vec::new() }
+    }
+    #[inline(always)]
+    fn get(&mut self) -> *mut u8 {
+        match self.free.pop() {
+            Some(p) => p,
+            None => self.arena.alloc(),
+        }
+    }
+    /// Hand back blocks whose records have been consumed and will never be read again.
+    pub fn recycle<T>(&mut self, segs: &[Seg<T>]) {
+        for s in segs {
+            self.free.push(s.p as *mut u8);
+        }
+    }
+}
+
+/// A finished run of records: exactly one arena block, possibly partly filled.
 pub struct Seg<T> {
     p: *const T,
     n: usize,
@@ -76,7 +103,7 @@ impl<T> Seg<T> {
     }
 }
 
-/// Append-only bucket made of arena blocks.
+/// Append-only bucket made of blocks.
 pub struct Bkt<T> {
     start: *mut T,
     cur: *mut T,
@@ -90,9 +117,9 @@ impl<T: Copy> Bkt<T> {
         Bkt { start: z, cur: z, end: z, done: Vec::new() }
     }
     #[inline(always)]
-    pub fn push(&mut self, v: T, a: &Arena) {
+    pub fn push(&mut self, v: T, b: &mut Blocks) {
         if self.cur == self.end {
-            self.refill(a);
+            self.refill(b);
         }
         unsafe {
             self.cur.write(v);
@@ -101,11 +128,11 @@ impl<T: Copy> Bkt<T> {
     }
     #[cold]
     #[inline(never)]
-    fn refill(&mut self, a: &Arena) {
+    fn refill(&mut self, b: &mut Blocks) {
         if !self.start.is_null() {
             self.done.push(Seg { p: self.start, n: unsafe { self.cur.offset_from(self.start) } as usize });
         }
-        let p = a.alloc() as *mut T;
+        let p = b.get() as *mut T;
         self.start = p;
         self.cur = p;
         self.end = unsafe { p.add(BLK / std::mem::size_of::<T>()) };
