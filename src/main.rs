@@ -640,9 +640,13 @@ fn stage3(ctx: &Ctx, names: &Names, s1: &[S1], s2: &[Vec<Vec<Seg<Ev>>>], nt: usi
                             }
                         }
                     }
-                    if !w.urows.is_empty() {
+                    if !w.urows.is_empty() && std::env::var_os("FM_NOWRITE").is_none() {
                         let name = |k: u64, buf: &mut Vec<u8>| name_of(k, b'u', names, buf);
+                        let tw = Instant::now();
                         write_user(&out_dir.join("user_daily").join(format!("part-{}.parquet", wi)), &w.urows, cats, &name);
+                        if std::env::var_os("FM_TIMEW").is_some() {
+                            eprintln!("write_user {} rows {:.4}s", w.urows.len(), tw.elapsed().as_secs_f64());
+                        }
                     }
                     w
                 })

@@ -13,7 +13,8 @@ Goal: the top of the Shopping Sessions leaderboard. At the time of the first sub
 | v3.1 | `42e0506` | **1.45 s** | **0.77 s** (v3 in the same A/B: 0.84 s) | unit tests, 36/36 fixtures + dev MATCH on arm64 and amd64; 20M identical to v1 |
 | v3.2 | `6f6ed83` | not submitted | single-thread work 3.73 s vs 4.14 s for v3.1 (interleaved, min of 6) | unit tests, fixtures, dev (also 997 / 64-byte ranges) on arm64 and amd64; 20M identical to v1 |
 | v3.3 | `341b502` | **1.17 s** (same code again at `d4dc286`: 1.14 s) | exit work after the last stage: best 15 ms vs 57 ms | same suite, both platforms; 20M identical to v1 |
-| v3.4 | see git log | not submitted yet | same as v3.3 locally; drops `MADV_POPULATE_READ` (slower on the scorer) | full suite, both platforms; 20M identical to v1 |
+| v3.4 | `5862f0d` | not submitted | same as v3.3 locally; drops `MADV_POPULATE_READ` (slower on the scorer) | full suite, both platforms; 20M identical to v1 |
+| v3.5 | see git log | not submitted yet | user_daily writing 0.15 to 0.18 s vs 0.19 to 0.28 s (single thread, 2.24M rows) | full suite, both platforms; 20M identical to v1; files read identically by polars, pyarrow and DuckDB, including empty tables |
 
 Local timings come from a Docker VM on an 8-core Apple-silicon Mac, with the data in `/dev/shm`. The Mac is often loaded, so one run can vary 2 to 3x. Only best-of-N is meaningful, and only the board counts.
 
@@ -52,6 +53,19 @@ Findings:
 * **Huge pages hurt.** `MADV_HUGEPAGE` on the arena made stage 1 0.62 s instead of 0.54 s.
 
 The scorer shows only the tail of stderr, so the system facts printed first were cut off. A future diagnostic should print its most important lines last.
+
+## v3.5: hand-written Parquet
+
+`out.rs` now writes Parquet itself:
+* "PAR1", then per column one or more plain-encoded, uncompressed v1 data pages of up to 128K rows, then a Thrift-compact `FileMetaData`, its length, and "PAR1"
+* `day` is INT32 with DATE annotations; strings are BYTE_ARRAY with UTF8/STRING; `top_category` is OPTIONAL with bit-packed definition levels
+* 2 of 6 user_daily columns are now INT32 (any integer width is accepted)
+
+This drops the parquet crate and its dependency tree. Checks:
+* 20M output is identical to v1 as read by polars, pyarrow and DuckDB.
+* Empty tables are valid in all three, and in the starter's fixture loader.
+
+The direct timing shows writing was about 4% of single-thread work, not the 10% an earlier noisy estimate suggested. So this is a small win.
 
 ## Where the time goes
 
