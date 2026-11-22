@@ -448,11 +448,20 @@ fn facts() -> String {
 
 /// One-line result of a BENCH=1 child (parse kernels, single thread).
 pub static BENCH_OUT: Mutex<String> = Mutex::new(String::new());
+/// Data and output statistics of an FM_STATS child.
+pub static STATS_OUT: Mutex<String> = Mutex::new(String::new());
+/// Slowest and total user_daily file write, in microseconds.
+pub static WRITE_MAX_US: AtomicU64 = AtomicU64::new(0);
+pub static WRITE_SUM_US: AtomicU64 = AtomicU64::new(0);
 
 fn lap_line() -> String {
     let b = BENCH_OUT.lock().unwrap().clone();
     if !b.is_empty() {
         return b;
+    }
+    let st = STATS_OUT.lock().unwrap().clone();
+    if !st.is_empty() {
+        return st;
     }
     let short = |l: &str| match l {
         "opened" => "o",
@@ -461,6 +470,7 @@ fn lap_line() -> String {
         "stage1 parse" => "p",
         "stage1 parse + links" => "p",
         "stage2 dedup" => "d",
+        "names" => "n",
         "stage3 sessions + user_daily" => "s",
         "written" => "w",
         _ => "?",
@@ -471,6 +481,7 @@ fn lap_line() -> String {
         parts.push(format!("{}{:.3}", short(name), t - prev));
         prev = *t;
     }
+    parts.push(format!("wu{:.3}", WRITE_MAX_US.load(Relaxed) as f64 / 1e6));
     parts.join(" ")
 }
 
@@ -564,20 +575,14 @@ pub fn main(data_dir: &Path, nt: usize, run: &dyn Fn(&Path, &Path, usize)) {
     let out = scratch.join("out");
     let variants: Vec<(&str, Vec<(&str, &str)>)> = vec![
         ("base", vec![]),
-        ("scan1", vec![("FM_SCAN1", "1")]),
-        ("pf1k", vec![("FM_PF", "1024")]),
-        ("s3div16", vec![("FM_S3DIV", "16")]),
-        ("s3-24k", vec![("FM_S3MAX", "24576")]),
-        ("nosub", vec![("FM_SUBMAX", "100000000")]),
-        ("b9/10", vec![("FM_B2", "10")]),
+        ("stats", vec![("FM_STATS", "1")]),
+        ("nowrite", vec![("FM_NOWRITE", "1")]),
+        ("scan2", vec![("FM_SCAN2", "1")]),
+        ("t4", vec![("FM_THREADS_S3", "4")]),
+        ("wbuf64m", vec![("FM_WBUF", "67108864")]),
         ("base2", vec![]),
-        ("scan1bl", vec![("FM_SCAN1", "1"), ("FM_SCANBL", "1")]),
-        ("scan1-2", vec![("FM_SCAN1", "1")]),
-        ("pf1k2", vec![("FM_PF", "1024")]),
-        ("s3div162", vec![("FM_S3DIV", "16")]),
+        ("nowrite2", vec![("FM_NOWRITE", "1")]),
     ];
-    // the first run after tiling pays for the fresh files: warm up, then measure
-    lines.push(format!("V warmup  {}", run_child(&t20, &out, nt, &[], run)));
     for (label, env) in &variants {
         lines.push(format!("V {:7} {}", label, run_child(&t20, &out, nt, env, run)));
     }
@@ -589,7 +594,7 @@ pub fn main(data_dir: &Path, nt: usize, run: &dyn Fn(&Path, &Path, usize)) {
     let (b, te, _, _) = timed(|| tile(data_dir, &t60, r60, nt));
     lines.push(format!("T {}x {} MB {:.2}s", r60, b >> 20, te));
     lines.push(format!("V 60:warm {}", run_child(&t60, &out, nt, &[], run)));
-    for (label, env) in [("60:base", vec![]), ("60:nos3", vec![("FM_S3MAX", "100000000")]), ("60:b10", vec![("FM_B1", "10"), ("FM_B2", "10")]), ("60:scan1", vec![("FM_SCAN1", "1")]), ("60:base2", vec![])] {
+    for (label, env) in [("60:base", vec![]), ("60:stats", vec![("FM_STATS", "1")]), ("60:nowrite", vec![("FM_NOWRITE", "1")]), ("60:wbuf64m", vec![("FM_WBUF", "67108864")]), ("60:base2", vec![])] {
         lines.push(format!("V {:7} {}", label, run_child(&t60, &out, nt, &env, run)));
     }
     let _ = std::fs::remove_dir_all(&t60);

@@ -134,6 +134,9 @@ struct ColMeta {
     bytes: u64,
 }
 
+/// Output buffer size in bytes (FM_WBUF; default 1 MB).
+pub static WBUF: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1 << 20);
+
 /// One output file, streamed to disk a page at a time through a 1 MB buffer.
 /// Fresh memory costs page faults on the scorer, so no file is assembled whole.
 struct File {
@@ -146,7 +149,8 @@ struct File {
 
 impl File {
     fn new(path: &Path, rows: usize) -> Self {
-        let mut w = std::io::BufWriter::with_capacity(1 << 20, std::fs::File::create(path).unwrap());
+        let cap = WBUF.load(std::sync::atomic::Ordering::Relaxed);
+        let mut w = std::io::BufWriter::with_capacity(cap, std::fs::File::create(path).unwrap());
         w.write_all(b"PAR1").unwrap();
         File { w, pos: 4, body: Vec::new(), cols: Vec::new(), rows }
     }

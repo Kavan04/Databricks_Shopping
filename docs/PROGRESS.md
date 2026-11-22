@@ -27,7 +27,8 @@ Goal: the top of the Shopping Sessions leaderboard. At the time of the first sub
 | v3.15 | `14060e9` | not submitted | branch-free linked-ID lookup and prefetch, branch-free dedup winner collection: single-thread dedup 0.81-0.95 s -> 0.60-0.69 s locally; clicks use the same lookup | full suite, both platforms; new unit test for the lookup |
 | v3.16 | `26b10fe` | not submitted | dedup tables at load <= 1/2 (was 3/4), split threshold 8K so tables stay at 384 KB: single-thread dedup 0.60-0.66 s -> 0.55-0.60 s locally | full suite, both platforms |
 | v3.17 | `2eef441` | not submitted | two-pass scanner for events and clicks: separator index per 64 KB without data-dependent loops, then lines from consecutive entries; microbenchmark 19.9 -> 16.0-18.6 ns per line, single-thread stage 1 about 10% faster locally | full suite, both platforms, plus the one-pass scanner (`FM_SCAN1=1`) on the dev set; new tests across 64 KB batch boundaries |
-| v3.18 | see git log | not submitted yet | product and campaign IDs of up to 7 bytes are packed into their key instead of hashed with xxh3 (every click looks up its campaign) | full suite, both platforms |
+| v3.18 | `4ec27bd` | not submitted | product and campaign IDs of up to 7 bytes are packed into their key instead of hashed with xxh3 (every click looks up its campaign) | full suite, both platforms |
+| v3.19 | see git log | not submitted yet | one-pass scanner again by default: on the scorer it beat the two-pass scanner (stage 1 0.632 vs 0.684 s at 20M, 1.909 vs 2.045 s at 60M); diagnostics v12 time the user_daily writes and report data statistics | full suite, both platforms, plus the two-pass scanner on the dev set |
 
 Local timings come from a Docker VM on an 8-core Apple-silicon Mac, with the data in `/dev/shm`. The Mac is often loaded, so one run can vary 2 to 3x. Only best-of-N is meaningful, and only the board counts.
 
@@ -129,6 +130,26 @@ Each variant runs in its own child process, so W includes exit and teardown (20x
 | 2048 + pre-fault | 3.518 |
 
 Process exit after the last lap is now about 10 ms. At 20M the stages take: parse 0.52 s, dedup 0.21 s, sessions 0.21 s, links 0.06 s, startup 0.025 s, release and campaign table 0.03 s.
+
+## Scorer diagnostics v11 (on v3.17)
+
+| Variant | Stage 1 (s) | Dedup (s) | Sessions (s) | Total W (s) |
+| --- | --- | --- | --- | --- |
+| base (two-pass scanner) | 0.684, 0.696 | 0.232, 0.221 | 0.495, 0.502 | 1.581, 1.584 |
+| one-pass scanner | 0.632, 0.649 | 0.230, 0.233 | 0.490, 0.489 | 1.513, 1.536 |
+| one-pass, unconditional commas | 0.673 | 0.241 | 0.489 | 1.563 |
+| input prefetch 1 KB | 0.687, 0.696 | | | 1.591, 1.585 |
+| groups of 16 events | | | 0.495, 0.497 | 1.570, 1.596 |
+| sessions split at 24K | | | 0.509 | 1.589 |
+| no dedup split | | 0.279 | | 1.633 |
+| 1024 person buckets | 0.707 | 0.258 | 0.499 | 1.631 |
+| 60M base / one-pass | 2.045 / 1.909 | 0.692 / 0.720 | 1.690 / 1.719 | 4.906 / 4.813 |
+
+Single-thread parse kernels on the scorer, ns per line: records 31.8 (one-pass), 30.9 (unconditional commas), 31.9 (two-pass); parse_event 71.8; full stage-1 sink 91.2 (one-pass), 96.6 (two-pass). On the scorer's Intel cores the two-pass scanner gains nothing, unlike on Apple silicon (20% faster there).
+
+Decisions: back to the one-pass scanner; keep the dedup split (without it dedup is 21% slower); keep groups of 4, the sessions split at 64K and 512 person buckets.
+
+The scorer's public dev set changed between diagnostics v3 and v11: the 20x tile grew from 1821 MB to 1975 MB with nearly the same lines per file. The sessions stage also grew from 0.21 s to 0.50 s, and the 60M run from 0.65 s to 1.69 s. Diagnostics v12 time the user_daily writes separately (the scratch disk still holds gigabytes of freshly tiled data, so writes may be throttled) and report data statistics.
 
 ## v3.17: a two-pass scanner
 

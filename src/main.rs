@@ -20,7 +20,7 @@ mod scan;
 use std::collections::HashMap;
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::Relaxed};
 use std::sync::OnceLock;
 use std::thread;
 use std::time::Instant;
@@ -260,9 +260,10 @@ const AHEAD: usize = 16;
 static LAHEAD: AtomicUsize = AtomicUsize::new(32);
 /// Event lines use the scanner's unconditional comma bookkeeping (FM_SCANBL).
 static SCAN_BL: AtomicBool = AtomicBool::new(false);
-/// Event and click lines use the two-pass scanner (FM_SCAN1 selects the
-/// one-pass scanner instead).
-static SCAN2: AtomicBool = AtomicBool::new(true);
+/// Event and click lines use the two-pass scanner (FM_SCAN2). Off: on the
+/// scorer the one-pass scanner was faster (stage 1 0.632 vs 0.684 s at 20M,
+/// 1.909 vs 2.045 s at 60M), unlike on Apple silicon.
+static SCAN2: AtomicBool = AtomicBool::new(false);
 
 fn stage1(ctx: &Ctx, arena: &Arena, files: &[InFile], tasks: &[RTask], nt: usize, lt_cell: &OnceLock<LinkTable>) -> Vec<S1> {
     let next = AtomicUsize::new(0);
@@ -916,6 +917,9 @@ fn stage3(ctx: &Ctx, names: &Names, s1: &[S1], s2: &[Vec<Vec<Seg<Ev>>>], nt: usi
                         let name = |k: u64, buf: &mut Vec<u8>| name_of(k, b'u', names, buf);
                         let tw = Instant::now();
                         write_user(&out_dir.join("user_daily").join(format!("part-{}.parquet", wi)), &w.urows, cats, &name);
+                        let us = tw.elapsed().as_micros() as u64;
+                        diag::WRITE_MAX_US.fetch_max(us, Relaxed);
+                        diag::WRITE_SUM_US.fetch_add(us, Relaxed);
                         if std::env::var_os("FM_TIMEW").is_some() {
                             eprintln!("write_user {} rows {:.4}s", w.urows.len(), tw.elapsed().as_secs_f64());
                         }
@@ -1086,7 +1090,8 @@ fn run(data_dir: &Path, out_dir: &Path, nt: usize, chunk: usize) {
     S3_DIV.store(std::env::var("FM_S3DIV").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(4).max(1), Relaxed);
     mem::PLAIN_STORES.store(std::env::var_os("FM_PLAINST").is_some(), Relaxed);
     SCAN_BL.store(std::env::var_os("FM_SCANBL").is_some(), Relaxed);
-    SCAN2.store(std::env::var_os("FM_SCAN1").is_none(), Relaxed);
+    SCAN2.store(std::env::var_os("FM_SCAN2").is_some(), Relaxed);
+    out::WBUF.store(std::env::var("FM_WBUF").ok().and_then(|v| v.parse().ok()).unwrap_or(1 << 20), Relaxed);
     TAB_X4.store(std::env::var_os("FM_TABX4").is_some(), Relaxed);
     scan::PF_DIST.store(std::env::var("FM_PF").ok().and_then(|v| v.parse().ok()).unwrap_or(0), Relaxed);
     let lap = |what: &str| {
@@ -1206,10 +1211,12 @@ fn run(data_dir: &Path, out_dir: &Path, nt: usize, chunk: usize) {
     for (k, s) in &lt.names {
         names.insert(*k, s.clone());
     }
+    lap("names");
     std::fs::create_dir_all(out_dir.join("user_daily")).unwrap();
     std::fs::create_dir_all(out_dir.join("campaign_daily")).unwrap();
     let cat_refs: Vec<&[u8]> = cats.iter().map(|c| &c[..]).collect();
-    let w3 = stage3(&ctx, &names, &s1, &s2, nt, &cat_refs, &out_dir);
+    let nt3 = std::env::var("FM_THREADS_S3").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(nt).clamp(1, nt.max(1));
+    let w3 = stage3(&ctx, &names, &s1, &s2, nt3, &cat_refs, &out_dir);
     lap("stage3 sessions + user_daily");
     if std::env::var_os("FM_NORELEASE").is_none() && std::env::var_os("FM_NORELAR").is_none() {
         arena.release(nt);
@@ -1241,6 +1248,16 @@ fn run(data_dir: &Path, out_dir: &Path, nt: usize, chunk: usize) {
     }
     write_campaign(&out_dir.join("campaign_daily").join("part-0.parquet"), &crows);
     lap("written");
+    if diag::QUIET.load(Relaxed) && std::env::var_os("FM_STATS").is_some() {
+        let e1: usize = s1.iter().map(|w| w.ev.iter().map(|b| seg_len(b)).sum::<usize>()).sum();
+        let ck: usize = s1.iter().map(|w| w.ck.iter().map(|b| seg_len(b)).sum::<usize>()).sum();
+        let strs: usize = s1.iter().map(|w| w.strs.len()).sum();
+        let ms = |a: &AtomicU64| a.load(Relaxed) as f64 / 1000.0;
+        *diag::STATS_OUT.lock().unwrap() = format!(
+            "S e1={} ck={} strs={} lnames={} names={} urows={} crows={} wmax={:.0}ms wsum={:.0}ms files={}",
+            e1, ck, strs, lt.names.len(), names.len(), total, crows.len(), ms(&diag::WRITE_MAX_US), ms(&diag::WRITE_SUM_US), files.len()
+        );
+    }
     if !diag::QUIET.load(Relaxed) {
         eprintln!("user rows {} campaign rows {}", total, crows.len());
     }
