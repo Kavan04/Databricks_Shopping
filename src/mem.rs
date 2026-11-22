@@ -154,6 +154,16 @@ impl<'a> Blocks<'a> {
             None => self.arena.alloc(),
         }
     }
+    /// Return the unused recycled blocks' pages to the kernel.
+    pub fn release_free(&mut self) {
+        if std::env::var_os("FM_NORELEASE").is_some() {
+            return;
+        }
+        for &p in &self.free {
+            unsafe { libc::madvise(p as *mut libc::c_void, BLK, libc::MADV_DONTNEED) };
+        }
+        self.free.clear();
+    }
     /// Hand back blocks whose records have been consumed and will never be read again.
     pub fn recycle<T>(&mut self, segs: &[Seg<T>]) {
         for s in segs {

@@ -17,10 +17,11 @@ mod mem;
 mod out;
 mod scan;
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+use std::sync::OnceLock;
 use std::thread;
 use std::time::Instant;
 
@@ -184,7 +185,7 @@ const AHEAD: usize = 16;
 /// Lookahead of stage 2's person lookups.
 static LAHEAD: AtomicUsize = AtomicUsize::new(32);
 
-fn stage1(ctx: &Ctx, arena: &Arena, files: &[InFile], tasks: &[RTask], nt: usize, lt: &LinkTable) -> Vec<S1> {
+fn stage1(ctx: &Ctx, arena: &Arena, files: &[InFile], tasks: &[RTask], nt: usize, lt_cell: &OnceLock<LinkTable>) -> Vec<S1> {
     let next = AtomicUsize::new(0);
     let keep_maps = std::env::var_os("FM_NORELEASE").is_some() || std::env::var_os("FM_NORELIN").is_some();
     let (nb1, nb2) = (1usize << ctx.b1bits, 1usize << ctx.b2bits);
@@ -215,6 +216,7 @@ fn stage1(ctx: &Ctx, arena: &Arena, files: &[InFile], tasks: &[RTask], nt: usize
                                 }
                             });
                         } else {
+                            let lt = lt_cell.wait();
                             cks.clear();
                             for_each_record::<4>(data, |f| {
                                 if let Some(c) = parse_click(ctx, f, &mut dc, &mut strs) {
@@ -324,7 +326,10 @@ fn stage2(ctx: &Ctx, s1: &[S1], lt: &LinkTable, arena: &Arena, nt: usize) -> Vec
                             out.push(bucket(p, ctx.b2bits), Ev { person: p, w2 }, &mut blocks);
                         }
                     }
-                    out.finish(&mut blocks)
+                    let segs = out.finish(&mut blocks);
+                    // event blocks not reused for output are dead: give them back now
+                    blocks.release_free();
+                    segs
                 })
             })
             .collect();
@@ -805,24 +810,26 @@ fn run(data_dir: &Path, out_dir: &Path, nt: usize, chunk: usize) {
     let day0 = ws.div_euclid(DAY);
     let ndays = ((we - 1).div_euclid(DAY) - day0 + 1) as usize;
 
-    // products -> category rank (byte order, "unknown" included)
+    // products -> category rank (byte order, "unknown" included); slices into the file buffer
     let prod_file = Padded::read(&data_dir.join("products.csv"));
-    let mut cat_set: BTreeSet<Vec<u8>> = BTreeSet::new();
-    let mut prod_rows: Vec<(u64, Vec<u8>)> = Vec::new();
+    let mut prod_rows: Vec<(u64, &[u8])> = Vec::new();
+    let mut cat_seen: HashMap<&[u8], ()> = HashMap::new();
     if let Some(d) = &prod_file {
         for_each_record::<2>(d.body(), |f| {
-            prod_rows.push((skey(f[0]), f[1].to_vec()));
-            cat_set.insert(f[1].to_vec());
+            prod_rows.push((skey(f[0]), f[1]));
+            cat_seen.insert(f[1], ());
         });
     }
-    cat_set.insert(b"unknown".to_vec());
-    let cats: Vec<Vec<u8>> = cat_set.into_iter().collect();
+    cat_seen.insert(b"unknown", ());
+    let mut cat_list: Vec<&[u8]> = cat_seen.into_keys().collect();
+    cat_list.sort_unstable();
+    let cats: Vec<Vec<u8>> = cat_list.iter().map(|c| c.to_vec()).collect();
     assert!(cats.len() <= CAT_MASK as usize, "too many categories for the record layout");
-    let cat_rank: HashMap<&[u8], u64> = cats.iter().enumerate().map(|(i, c)| (&c[..], i as u64)).collect();
+    let cat_rank: HashMap<&[u8], u64> = cat_list.iter().enumerate().map(|(i, c)| (*c, i as u64)).collect();
     let unknown_cat = cat_rank[&b"unknown"[..]];
     let mut prods = U64Map::with_capacity(prod_rows.len() + 16);
     for (k, c) in &prod_rows {
-        prods.get_or_insert(*k, cat_rank[&c[..]]);
+        prods.get_or_insert(*k, cat_rank[c]);
     }
 
     // campaigns
@@ -852,16 +859,15 @@ fn run(data_dir: &Path, out_dir: &Path, nt: usize, chunk: usize) {
     add_files(&data_dir.join("links"), 2, chunk.min(1 << 20), &mut files, &mut lk_tasks);
     let est_rows = ev_bytes / 64 + 1;
     let env_bits = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<u32>().ok());
-    // 512 buckets at 20M events: on the scorer 512 beat 1024, 2048 and 4096
-    let b1bits = env_bits("FM_B1").unwrap_or(log2_ceil(est_rows / 65536).clamp(6, 11));
-    let b2bits = env_bits("FM_B2").unwrap_or(log2_ceil(est_rows / 65536).clamp(6, 11));
+    // 512 event and person buckets: on the scorer 512 beat 128, 256, 1024, 2048
+    // and 4096 at 20M events, and 1024 and 2048 at 60M
+    let b1bits = env_bits("FM_B1").unwrap_or(9);
+    let b2bits = env_bits("FM_B2").unwrap_or(9);
     for t in tasks.iter().take(2 * nt) {
         prefetch_range(&files[t.file], t.off, t.len);
     }
     lap("opened");
 
-    let lt = links::build(&files, &lk_tasks, nt);
-    lap("links");
 
     let (base_day, base_off) = (base.div_euclid(DAY), base.rem_euclid(DAY));
     let ctx = Ctx { ws, we, base, day0, ndays, base_day, base_off, camps, ncamp, prods, unknown_cat, b1bits, b2bits };
@@ -877,8 +883,19 @@ fn run(data_dir: &Path, out_dir: &Path, nt: usize, chunk: usize) {
         arena.prepopulate(need + need / 16, nt, mode == "huge");
         lap("prepopulated");
     }
-    let s1 = stage1(&ctx, &arena, &files, &tasks, nt, &lt);
-    lap("stage1 parse");
+    // Link joining runs on a few threads of its own while stage 1 parses
+    // events, which do not need it; clicks come last and wait for it.
+    let lt_cell: OnceLock<LinkTable> = OnceLock::new();
+    let s1 = thread::scope(|s| {
+        let (cell, files, lk) = (&lt_cell, &files, &lk_tasks);
+        let lnt = std::env::var("FM_LINK_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(3usize).clamp(1, nt.max(1));
+        s.spawn(move || {
+            let _ = cell.set(links::build(files, lk, lnt));
+        });
+        stage1(&ctx, &arena, &files, &tasks, nt, &lt_cell)
+    });
+    let lt = lt_cell.into_inner().unwrap();
+    lap("stage1 parse + links");
 
     let s2 = stage2(&ctx, &s1, &lt, &arena, nt);
     lap("stage2 dedup");

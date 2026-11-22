@@ -16,7 +16,8 @@ Goal: the top of the Shopping Sessions leaderboard. At the time of the first sub
 | v3.4 | `5862f0d` | not submitted | same as v3.3 locally; drops `MADV_POPULATE_READ` (slower on the scorer) | full suite, both platforms; 20M identical to v1 |
 | v3.5 | `278d5a8` | not submitted | user_daily writing 0.15 to 0.18 s vs 0.19 to 0.28 s (single thread, 2.24M rows) | full suite, both platforms; 20M identical to v1; files read identically by polars, pyarrow and DuckDB, including empty tables |
 | v3.6 | `300031f` | not submitted | 512 buckets by default (best on the scorer) | full suite, both platforms; 20M identical to v1 |
-| v3.7 | see git log | not submitted yet | two-stage prefetch for person lookups: the filter word is fetched before it is checked, so the prefetch pass no longer stalls on it | full suite, both platforms; 20M identical to v1 |
+| v3.7 | `2ea5cf5` | not submitted | two-stage prefetch for person lookups: the filter word is fetched before it is checked, so the prefetch pass no longer stalls on it | full suite, both platforms; 20M identical to v1 |
+| v3.8 | see git log | not submitted yet | link joining overlapped with event parsing; 512 buckets at every scale; startup without per-line allocations; unused event blocks released at the end of stage 2 | full suite, both platforms; 20M identical to v1 |
 
 Local timings come from a Docker VM on an 8-core Apple-silicon Mac, with the data in `/dev/shm`. The Mac is often loaded, so one run can vary 2 to 3x. Only best-of-N is meaningful, and only the board counts.
 
@@ -96,6 +97,28 @@ Sampling profile of a default run (2301 samples of CPU time), hottest:
 | 5% + 3.7% | `PartMap::get` + Bloom `maybe` | person lookups; the 1.8 MB Bloom filter misses the 1 MB L2 |
 | 3.8% | `person_proc` | sessions |
 | 3.1% | `madvise` | early release |
+
+## Diagnostic v3: settings including process exit (forked runs)
+
+Each variant runs in its own child process, so W includes exit and teardown (20x tiled dev set = 20M events; 60x = 60M):
+
+| Variant | 20M W | Note |
+| --- | --- | --- |
+| 512 buckets | **1.060 / 1.072** | best |
+| 256 / 128 buckets | 1.111 / 1.137 | |
+| 1024 buckets | 1.253 | first run, partly cold |
+| no early release | 1.104 | releasing early wins, including exit |
+| no input release / no arena release | 1.084 / 1.112 | both releases help |
+| pre-fault arena (4 KB / huge) | 1.137 / 1.202 | the up-front cost outweighs the faults it saves |
+
+| Variant | 60M W |
+| --- | --- |
+| **512 buckets** | **3.529** |
+| 1024 buckets | 3.686 |
+| 2048 buckets (old automatic choice) | 3.820 |
+| 2048 + pre-fault | 3.518 |
+
+Process exit after the last lap is now about 10 ms. At 20M the stages take: parse 0.52 s, dedup 0.21 s, sessions 0.21 s, links 0.06 s, startup 0.025 s, release and campaign table 0.03 s.
 
 ## Where the time goes
 

@@ -452,6 +452,7 @@ fn lap_line() -> String {
         "links" => "l",
         "prepopulated" => "pp",
         "stage1 parse" => "p",
+        "stage1 parse + links" => "p",
         "stage2 dedup" => "d",
         "stage3 sessions + user_daily" => "s",
         "written" => "w",
