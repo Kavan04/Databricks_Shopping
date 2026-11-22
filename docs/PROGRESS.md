@@ -12,7 +12,8 @@ Goal: the top of the Shopping Sessions leaderboard. At the time of the first sub
 | v3 | `2402180` | not submitted | **0.80 s** (v2.1: 1.04 s) | unit tests (fast parsers and scanner vs reference), 36/36 fixtures, dev MATCH, boundary stress, on arm64 and amd64; 20M identical to v1 |
 | v3.1 | `42e0506` | **1.45 s** | **0.77 s** (v3 in the same A/B: 0.84 s) | unit tests, 36/36 fixtures + dev MATCH on arm64 and amd64; 20M identical to v1 |
 | v3.2 | `6f6ed83` | not submitted | single-thread work 3.73 s vs 4.14 s for v3.1 (interleaved, min of 6) | unit tests, fixtures, dev (also 997 / 64-byte ranges) on arm64 and amd64; 20M identical to v1 |
-| v3.3 | `341b502` | **1.17 s** | exit work after the last stage: best 15 ms vs 57 ms | same suite, both platforms; 20M identical to v1 |
+| v3.3 | `341b502` | **1.17 s** (same code again at `d4dc286`: 1.14 s) | exit work after the last stage: best 15 ms vs 57 ms | same suite, both platforms; 20M identical to v1 |
+| v3.4 | see git log | not submitted yet | same as v3.3 locally; drops `MADV_POPULATE_READ` (slower on the scorer) | full suite, both platforms; 20M identical to v1 |
 
 Local timings come from a Docker VM on an 8-core Apple-silicon Mac, with the data in `/dev/shm`. The Mac is often loaded, so one run can vary 2 to 3x. Only best-of-N is meaningful, and only the board counts.
 
@@ -30,6 +31,27 @@ Since v1, every local gain has shrunk by roughly half on the board. v1 was domin
 * CPU, caches, huge-page policy, kernel, mounts
 * page-fault, bandwidth, random-access and input-read microbenchmarks
 * per-stage user/kernel times for six pipeline runs on a 20x tiled dev set in `/scratch`: 8, 4 and 1 threads, and huge pages on
+
+## What the scorer showed (diagnostic run, Sat ~12:50)
+
+The diagnostic ran on the scorer; its log tail came back. One pipeline run on the 20x tiled dev set, 20M events and 1.8 GB, 8 threads:
+
+| Stage | Wall | CPU (user + sys) |
+| --- | --- | --- |
+| open, small tables | 0.024 s | |
+| links | 0.053 s | 0.34 s |
+| stage 1 parse | 0.536 s | 4.24 s (sys 0.61) |
+| stage 2 dedup | 0.205 s | 1.63 s |
+| stage 3 sessions + user_daily | 0.233 s | 1.83 s |
+| campaign table, arena release | 0.033 s | 0.19 s |
+| **total** | **1.07 to 1.09 s** | user 7.1 s, sys 1.1 s |
+
+Findings:
+* **CPU-bound.** All 8 threads stay busy, and 87% of CPU is our own code. Per thread the scorer does about half the work of one Mac core, so 8 scorer threads are worth about 3.6 Mac cores. Reaching about 0.3 s means about 3.5x less work per line.
+* **Input reading is cheap.** Touching 1.65 GB of cached input with 8 threads took 0.02 s with plain page faults (84 GB/s), 0.04 s with `MADV_POPULATE_READ` (44 GB/s) and 0.05 s with `pread` (35 GB/s). v3.4 drops `POPULATE_READ`.
+* **Huge pages hurt.** `MADV_HUGEPAGE` on the arena made stage 1 0.62 s instead of 0.54 s.
+
+The scorer shows only the tail of stderr, so the system facts printed first were cut off. A future diagnostic should print its most important lines last.
 
 ## Where the time goes
 

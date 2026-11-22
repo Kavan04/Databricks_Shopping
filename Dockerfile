@@ -11,7 +11,4 @@ FROM debian:bookworm-slim
 RUN useradd --uid 1000 --no-create-home --home-dir /scratch app
 COPY --from=build /shopping /app/shopping
 WORKDIR /app
-# TEMPORARY diagnostic build: prints scorer facts and timings, then fails the
-# dev check on purpose so the logs are shown. Revert after one submission.
-ENV FM_DIAG=1
 CMD ["/app/shopping"]
