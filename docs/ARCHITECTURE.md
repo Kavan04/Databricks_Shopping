@@ -1,4 +1,4 @@
-# Architecture (v3.11)
+# Architecture (v3.17)
 
 How `src/` turns the CSV logs in `/data` into the two Parquet tables. The spec is `rules.md`; this page explains the data flow and the reasons for each design choice. Scores, measurements and experiments are tracked in [PROGRESS.md](PROGRESS.md).
 
@@ -67,22 +67,29 @@ Ranges are byte offsets, not line-aligned, so nothing scans the file before work
 
 ## 3. Scanner and dialect check
 
-`scan::for_each_record` turns each 64-byte block into three bitmasks: comma, quote and newline. It uses AVX2 on the scorer and NEON on ARM. For each line it records the comma positions and **counts** the quotes. The dialect check is branch-free per field:
+`scan::scan_records2` works in two passes over each 64 KB batch of a range. Each 64-byte block becomes three bitmasks (comma, quote, newline), using AVX2 on the scorer and NEON on ARM.
 
 ```mermaid
 flowchart TD
-    F["field [s, e)"] --> Q{"starts with a quote?"}
-    Q -->|yes| E{"length >= 2 and<br/>ends with a quote?"}
-    E -->|no| BAD[line malformed]
-    E -->|yes| U["value = inside the quotes<br/>quoted fields += 1"]
-    Q -->|no| V["value = whole field"]
-    U --> N{"after all N fields:<br/>quotes on the line ==<br/>2 x quoted fields?"}
-    V --> N
-    N -->|no| BAD
-    N -->|yes| OK[fields handed to the parser]
+    B["64-byte block -> comma, quote, newline masks"] --> S["pass 1: write every separator position<br/>(comma or newline) to a flat list,<br/>8 unconditionally, a loop only past 8"]
+    B --> N["pass 1: per newline, its rank in that list<br/>and the running quote count,<br/>2 unconditionally, a loop only past 2"]
+    S --> L["pass 2: per line"]
+    N --> L
+    L --> C{"commas = rank difference == N - 1?"}
+    C -->|no| BAD[line malformed]
+    C -->|yes| F["fields from consecutive entries;<br/>quotes = running count difference"]
+    F --> Q{"each field: starts with a quote -><br/>ends with one, length >= 2;<br/>quotes == 2 x quoted fields?"}
+    Q -->|no| BAD
+    Q -->|yes| OK["fields to the sink (inlined parser)"]
 ```
 
-Any quote that is not the first or last byte of a field breaks the count, so the count check replaces a per-quote position check. Randomized tests compare the scanner to a plain reference splitter.
+The one-pass scanner (`FM_SCAN1=1`) walked each block's newlines and each line segment's commas in loops. A line is about 75 bytes, so a block holds 0, 1 or 2 newlines and a segment 0 to 6 commas. The predictor cannot guess those loop exits. In the dev data, a block holds more than 8 separators 0.005% of the time and more than 2 newlines almost never, so pass 1 has no unpredictable branches.
+
+Any quote that is not the first or last byte of a field breaks the count, so the count check replaces a per-quote position check. Field splitting does not branch on field length: an empty field's first byte is the separator after it, never a quote.
+
+The per-line work runs in a `Sink` whose `rec` is `#[inline(always)]`, so the event and click parsers are compiled into the scanner loop. A closure was LLVM's call to make, and for the event parser it chose a real call per line, with the seven field slices spilled to the stack.
+
+Randomized tests compare both scanners to a plain reference splitter, including megabytes of lines across batch boundaries and a line longer than a batch.
 
 ## 4. Keys instead of strings
 
@@ -165,13 +172,21 @@ flowchart LR
     B --> R["input blocks recycled<br/>for this worker's output"]
     S -->|no| D[dropped]
     S -->|yes| PC["purchase? price + category from<br/>the earliest Pc copy of that eid"]
-    PC --> P["resolve person<br/>(Bloom + PartMap, prefetched 32 and 64 ahead)"]
+    PC --> P["resolve person, branch-free<br/>(Bloom + PartMap, prefetched 32 and 64 ahead)"]
     P --> O["Ev into person bucket"]
 ```
 
 Dedup happens before validation, as the rules require: an invalid earliest copy still wins its eid and then drops the event.
 
-At 60M events a 512-way bucket holds about 125K records. One table for all of them would be 6 MB per worker, so nearly every insert would miss both L2 (1 MB per core on the scorer) and the shared L3. Splitting first costs one sequential pass and keeps every insert in L2.
+At 60M events a 512-way bucket holds about 125K records. One table for all of them would be 6 MB per worker, so nearly every insert would miss both L2 (1 MB per core on the scorer) and the shared L3. Splitting first costs one sequential pass and keeps every insert in L2. Tables run at load <= 1/2, so most inserts find their home slot free or holding their own event id.
+
+Three branches here used to depend on random data, and each mispredicted often:
+
+| Branch | Fix |
+| --- | --- |
+| Is this user a linked ID? (about a third are) | a filtered-out key reads a static empty slot; pointer and result are chosen with masks |
+| Prefetch the person slot? | a filtered-out key prefetches the dummy slot, which is already cached |
+| Is this table slot a valid winner? (about a third are empty) | every slot is written; the output length advances by the valid bit |
 
 ## 8. Stage D: sessions, credit and assists
 
