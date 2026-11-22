@@ -143,8 +143,9 @@ fn parse_event(ctx: &Ctx, f: &[&[u8]; 7], dc: &mut DateCache, strs: &mut Vec<(u6
         return None;
     }
     let eid = pkey_p(f[0], b'e');
-    let ing = ts_p(f[3], dc).unwrap_or(i64::MAX);
-    let ing_rel = (ing.div_euclid(1000) - ctx.ing0).clamp(0, 0xFFFF_FFFF) as u64;
+    let ing_s = ingest_s(f[3], dc).unwrap_or(i64::MAX / 1000);
+    let ing = ing_s * 1000;
+    let ing_rel = (ing_s - ctx.ing0).clamp(0, 0xFFFF_FFFF) as u64;
     let bad = (E1 { eid, user: 0, w: ing_rel << 1 }, 0);
     if f[1].is_empty() || f[5].is_empty() {
         return Some(bad);
@@ -188,6 +189,45 @@ fn parse_event(ctx: &Ctx, f: &[&[u8]; 7], dc: &mut DateCache, strs: &mut Vec<(u6
     Some((E1 { eid, user: user | flag, w: (ts_rel << 33) | (ing_rel << 1) | 1 }, pc))
 }
 
+/// Stage 1's per-worker state for event lines, as a scanner sink whose
+/// per-line work is always inlined into the scanner loop.
+struct EvSink<'c, 'b> {
+    ctx: &'c Ctx,
+    dc: DateCache,
+    strs: Vec<(u64, Vec<u8>)>,
+    ev: WcBuckets<E1, 8>,
+    pr: WcBuckets<Pc, 8>,
+    blocks: Blocks<'b>,
+}
+
+impl<'a, 'c, 'b> Sink<'a, 7> for EvSink<'c, 'b> {
+    #[inline(always)]
+    fn rec(&mut self, f: &[&'a [u8]; 7]) {
+        if let Some((e, pc)) = parse_event(self.ctx, f, &mut self.dc, &mut self.strs) {
+            let b = bucket(e.eid, self.ctx.b1bits);
+            self.ev.push(b, e, &mut self.blocks);
+            if pc != 0 {
+                self.pr.push(b, Pc { eid: e.eid, pc, ing: e1_ingest(e.w) }, &mut self.blocks);
+            }
+        }
+    }
+}
+
+/// Click lines of one range, parsed into `cks` (person lookups come after).
+struct CkSink<'x, 'c, 'b> {
+    es: &'x mut EvSink<'c, 'b>,
+    cks: &'x mut Vec<Ck>,
+}
+
+impl<'a, 'x, 'c, 'b> Sink<'a, 4> for CkSink<'x, 'c, 'b> {
+    #[inline(always)]
+    fn rec(&mut self, f: &[&'a [u8]; 4]) {
+        if let Some(c) = parse_click(self.es.ctx, f, &mut self.es.dc, &mut self.es.strs) {
+            self.cks.push(c);
+        }
+    }
+}
+
 /// A valid click with `person` still holding the user's key.
 #[inline(always)]
 fn parse_click(ctx: &Ctx, f: &[&[u8]; 4], dc: &mut DateCache, strs: &mut Vec<(u64, Vec<u8>)>) -> Option<Ck> {
@@ -220,12 +260,8 @@ fn stage1(ctx: &Ctx, arena: &Arena, files: &[InFile], tasks: &[RTask], nt: usize
         let hs: Vec<_> = (0..nt)
             .map(|_| {
                 s.spawn(|| {
-                    let mut blocks = Blocks::new(arena);
-                    let mut ev: WcBuckets<E1, 8> = WcBuckets::new(nb1);
-                    let mut pr: WcBuckets<Pc, 8> = WcBuckets::new(nb1);
+                    let mut es = EvSink { ctx, dc: DateCache::new(), strs: Vec::new(), ev: WcBuckets::new(nb1), pr: WcBuckets::new(nb1), blocks: Blocks::new(arena) };
                     let mut ck: Vec<Bkt<Ck>> = (0..nb2).map(|_| Bkt::new()).collect();
-                    let mut strs = Vec::new();
-                    let mut dc = DateCache::new();
                     let mut cks: Vec<Ck> = Vec::new();
                     loop {
                         let i = next.fetch_add(1, Relaxed);
@@ -238,28 +274,15 @@ fn stage1(ctx: &Ctx, arena: &Arena, files: &[InFile], tasks: &[RTask], nt: usize
                         let t = &tasks[i];
                         let data = lines_in(&files[t.file], t.off, t.len);
                         if t.kind == 0 {
-                            let mut cb = |f: &[&[u8]; 7]| {
-                                if let Some((e, pc)) = parse_event(ctx, f, &mut dc, &mut strs) {
-                                    let b = bucket(e.eid, ctx.b1bits);
-                                    ev.push(b, e, &mut blocks);
-                                    if pc != 0 {
-                                        pr.push(b, Pc { eid: e.eid, pc, ing: e1_ingest(e.w) }, &mut blocks);
-                                    }
-                                }
-                            };
                             if SCAN_BL.load(Relaxed) {
-                                for_each_record_v::<7, true>(data, &mut cb);
+                                scan_records::<7, true, _>(data, &mut es);
                             } else {
-                                for_each_record_v::<7, false>(data, &mut cb);
+                                scan_records::<7, false, _>(data, &mut es);
                             }
                         } else {
                             let lt = lt_cell.wait();
                             cks.clear();
-                            for_each_record::<4>(data, |f| {
-                                if let Some(c) = parse_click(ctx, f, &mut dc, &mut strs) {
-                                    cks.push(c);
-                                }
-                            });
+                            scan_records::<4, false, _>(data, &mut CkSink { es: &mut es, cks: &mut cks });
                             for j in 0..cks.len() {
                                 if j + 2 * AHEAD < cks.len() {
                                     lt.map.prefetch_filter(cks[j + 2 * AHEAD].person);
@@ -269,13 +292,14 @@ fn stage1(ctx: &Ctx, arena: &Arena, files: &[InFile], tasks: &[RTask], nt: usize
                                 }
                                 let mut c = cks[j];
                                 c.person = lt.resolve(c.person);
-                                ck[bucket(c.person, ctx.b2bits)].push(c, &mut blocks);
+                                ck[bucket(c.person, ctx.b2bits)].push(c, &mut es.blocks);
                             }
                         }
                         if !keep_maps {
                             release_range(&files[t.file], t.off, t.len);
                         }
                     }
+                    let EvSink { ev, pr, mut blocks, strs, .. } = es;
                     S1 {
                         ev: ev.finish(&mut blocks),
                         pr: pr.finish(&mut blocks),
@@ -927,7 +951,7 @@ fn bench(ctx: &Ctx, files: &[InFile], tasks: &[RTask]) {
     let arena = Arena::new();
     let mut warm = Blocks::new(&arena);
     let mut res = Vec::new();
-    const NAMES: [&str; 9] = ["memchr-nl", "records", "records-bl", "+2 keys", "+2 ts", "parse_event", "parse_event-bl", "+push (fresh memory)", "+push (recycled memory)"];
+    const NAMES: [&str; 10] = ["memchr-nl", "records", "records-bl", "+2 keys", "+2 ts", "parse_event", "parse_event-bl", "+push (fresh memory)", "+push (recycled memory)", "stage-1 sink (fresh memory)"];
     let mut ns = Vec::new();
     let reps = if diag::QUIET.load(Relaxed) { 3 } else { 5 };
     for mode in 0..NAMES.len() {
@@ -957,11 +981,16 @@ fn bench(ctx: &Ctx, files: &[InFile], tasks: &[RTask]) {
                         acc = acc.wrapping_add(e.eid ^ e.w ^ e.user ^ pc);
                     }
                 }),
-                _ => for_each_record::<7>(d, |f| {
+                7 | 8 => for_each_record::<7>(d, |f| {
                     if let Some((e, _)) = parse_event(ctx, f, &mut dc, &mut strs) {
                         ev.push(bucket(e.eid, bb), e, wb);
                     }
                 }),
+                _ => {
+                    let mut es = EvSink { ctx, dc: DateCache::new(), strs: Vec::new(), ev: WcBuckets::new(1usize << bb), pr: WcBuckets::new(1usize << bb), blocks: Blocks::new(&arena) };
+                    scan_records::<7, false, _>(d, &mut es);
+                    acc = es.strs.len() as u64;
+                }
             }
             std::hint::black_box(acc);
             best = best.min(t.elapsed().as_secs_f64());
@@ -976,7 +1005,7 @@ fn bench(ctx: &Ctx, files: &[InFile], tasks: &[RTask]) {
     }
     if diag::QUIET.load(Relaxed) {
         let v: Vec<String> = ns.iter().map(|x| format!("{:.1}", x)).collect();
-        *diag::BENCH_OUT.lock().unwrap() = format!("nl {} rec {}/{} keys {} ts {} pe {}/{} push {}/{} ns/line ({} lines)", v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8], lines);
+        *diag::BENCH_OUT.lock().unwrap() = format!("nl {} rec {}/{} keys {} ts {} pe {}/{} push {}/{} sink {} ns/line ({} lines)", v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8], v[9], lines);
         return;
     }
     eprintln!("bench on {} MB, {} lines:\n  {}", d.len() >> 20, lines, res.join("\n  "));

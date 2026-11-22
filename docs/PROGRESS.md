@@ -21,7 +21,8 @@ Goal: the top of the Shopping Sessions leaderboard. At the time of the first sub
 | v3.9 | `fb3b6c7` | not submitted | 24-byte event records: push 2.5 to 5 ns per line instead of 10 to 14; single-thread total 3.46 s vs 3.53 s | full suite, both platforms; 20M identical to v1 |
 | v3.10 | `95fc882` | not submitted | Parquet streamed to disk page by page (about 90 MB less fresh memory); diagnostics switches for plain vs streaming stores and dedup-table prefetch | full suite, both platforms; 20M identical to v1 in polars, pyarrow and DuckDB |
 | v3.11 | `74531b3` | not submitted | dedup buckets over 12K records split into L2-sized pieces first; purchase side records carry their ingest so the price always comes from the winning copy | full suite, both platforms, plus forced splitting (dev with `FM_SUBMAX=100`, fixtures with `FM_SUBMAX=1`) |
-| v3.12 | see git log | not submitted yet | sessions stage: person buckets over 64K events (the 60M scale) are first split into pieces of whole persons, so grouping runs in L2; 20M runs are unchanged | full suite, both platforms, plus forced splitting (dev with `FM_S3MAX=100`, fixtures with `FM_S3MAX=1`, 20M with `FM_S3MAX=20000` identical to v1) |
+| v3.12 | `f773190` | not submitted | sessions stage: person buckets over 64K events (the 60M scale) are first split into pieces of whole persons, so grouping runs in L2; 20M runs are unchanged | full suite, both platforms, plus forced splitting (dev with `FM_S3MAX=100`, fixtures with `FM_S3MAX=1`, 20M with `FM_S3MAX=20000` identical to v1) |
+| v3.13 | see git log | not submitted yet | event and click parsers compiled into the scanner loop (no call per line); `ingest_ts` fast path (always valid F1 by the rules); single-thread stage 1 about 12% faster locally | full suite, both platforms; new unit test for the ingest parser |
 
 Local timings come from a Docker VM on an 8-core Apple-silicon Mac, with the data in `/dev/shm`. The Mac is often loaded, so one run can vary 2 to 3x. Only best-of-N is meaningful, and only the board counts.
 
@@ -123,6 +124,21 @@ Each variant runs in its own child process, so W includes exit and teardown (20x
 | 2048 + pre-fault | 3.518 |
 
 Process exit after the last lap is now about 10 ms. At 20M the stages take: parse 0.52 s, dedup 0.21 s, sessions 0.21 s, links 0.06 s, startup 0.025 s, release and campaign table 0.03 s.
+
+## v3.13: no function call per line
+
+The x86 disassembly of stage 1 showed the event parser was not inlined into the scanner loop. LLVM called the closure once per line, and before each call it spilled the seven field slices to the stack (14 stores, then 14 loads in the callee), plus `vzeroupper` and a full register save. The loop body also spilled heavily around the call.
+
+The scanner now feeds a `Sink` trait whose `rec` is `#[inline(always)]`. Events and clicks implement it, so the per-line work is compiled into the loop. `ingest_ts` is always valid F1 per the rules, so it takes a fast path: no time-field checks, and seconds directly instead of a round trip through milliseconds. Any other shape falls back to the general parser.
+
+Single-thread stage 1 on the 20M set, six interleaved runs each:
+
+| | Stage 1 times, sorted (s) |
+| --- | --- |
+| v3.12 | 1.75 1.83 1.95 2.05 2.24 2.39 |
+| v3.13 | 1.53 1.65 1.70 1.82 1.91 1.98 |
+
+The microbenchmark's own sink mode reads slower than its closure mode (56 vs 45 ns per line). That mode sits in a function with ten benchmark loops, so it is not representative; the pipeline numbers above are.
 
 ## v3.11: dedup tables that fit in L2
 

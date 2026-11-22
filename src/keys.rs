@@ -493,6 +493,22 @@ pub fn ts_p(f: &[u8], dc: &mut DateCache) -> Option<i64> {
     Some(v as i64)
 }
 
+/// An event's `ingest_ts` in whole seconds since the epoch. The rules make it
+/// always valid F1 (`YYYY-MM-DDTHH:MM:SSZ`), so that shape skips the time
+/// checks and the ms round trip; anything else takes the general parser.
+#[inline(always)]
+pub fn ingest_s(f: &[u8], dc: &mut DateCache) -> Option<i64> {
+    let p = f.as_ptr();
+    if f.len() == 20 && f[10] == b'T' && f[19] == b'Z' {
+        let (w0, w1, t) = unsafe { (ld8(p), (ld8(p.add(8)) & 0xFFFF) as u16, ld8(p.add(11))) };
+        let days = dc.get(w0, w1, f)?;
+        let d = t.wrapping_sub(0x3030_0030_3000_3030);
+        let b = |i: u32| ((d >> (8 * i)) & 0xFF) as i64;
+        return Some(days * 86400 + (b(0) * 10 + b(1)) * 3600 + (b(3) * 10 + b(4)) * 60 + b(6) * 10 + b(7));
+    }
+    ts_p(f, dc).map(|ms| ms.div_euclid(1000))
+}
+
 /// Purchase price: ASCII digits, value 1..=10_000_000, leading zeros allowed.
 #[inline(always)]
 pub fn parse_price(f: &[u8]) -> Option<u64> {
@@ -642,6 +658,29 @@ mod tests {
         for s in ["2028-02-29T00:00:00Z", "2027-02-29T00:00:00Z", "2026-10-03T19:58:10-04:00", "0001791071890000", "86400000", "1791071890000.0", "-5", "1.79e12", "2026-10-03T24:00:00Z", "2026-10-03T23:59:60Z", "2026-10-04T01:30:00+24:00", "2026-10-04T01:30:00+05:60", "2026-10-04T01:30:00-00:00"] {
             let buf = padded(s.as_bytes(), b'9');
             assert_eq!(ts_p(&buf[..s.len()], &mut dc), parse_ts(s.as_bytes()), "{}", s);
+        }
+    }
+
+    /// ingest_s equals the reference in seconds on every valid F1 value (the
+    /// only form ingest_ts takes), and matches the general parser elsewhere.
+    #[test]
+    fn ingest_matches_reference() {
+        let mut r = Rng(11);
+        let mut dc = DateCache::new();
+        for _ in 0..1_000_000 {
+            let (y, mo) = (1970 + r.below(100) as i64, 1 + r.below(12) as u32);
+            let d = 1 + r.below(days_in_month(y as u32, mo) as u64) as u32;
+            let s = format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", y, mo, d, r.below(24), r.below(60), r.below(60));
+            let buf = padded(s.as_bytes(), b'7');
+            assert_eq!(ingest_s(&buf[..s.len()], &mut dc), parse_ts(s.as_bytes()).map(|ms| ms / 1000), "{}", s);
+        }
+        for _ in 0..1_000_000 {
+            let t = ts_cases(&mut r);
+            if t.len() == 20 && t[10] == b'T' && t[19] == b'Z' {
+                continue; // the trusted shape: valid values are covered above
+            }
+            let buf = padded(&t, b':');
+            assert_eq!(ingest_s(&buf[..t.len()], &mut dc), parse_ts(&t).map(|ms| ms.div_euclid(1000)), "{:?}", String::from_utf8_lossy(&t));
         }
     }
 }

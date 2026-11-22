@@ -127,18 +127,42 @@ fn fields<'a, const N: usize>(d: &'a [u8], s0: usize, e0: usize, commas: &[u32; 
     Some(std::array::from_fn(|k| unsafe { std::slice::from_raw_parts(p.add(st[k]), ln[k]) }))
 }
 
+/// Receives the fields of each well-formed line. A hot sink marks `rec`
+/// #[inline(always)], so its work is compiled into the scanner loop instead of
+/// being called once per line (a closure's call is LLVM's choice, and for the
+/// event parser it chose a call that spilled all seven fields to the stack).
+pub trait Sink<'a, const N: usize> {
+    fn rec(&mut self, f: &[&'a [u8]; N]);
+}
+
+/// A closure as a sink.
+pub struct FnSink<F>(pub F);
+
+impl<'a, const N: usize, F: FnMut(&[&'a [u8]; N])> Sink<'a, N> for FnSink<F> {
+    #[inline(always)]
+    fn rec(&mut self, f: &[&'a [u8]; N]) {
+        (self.0)(f)
+    }
+}
+
 /// Call `f` with the fields of every well-formed line of `data` (which starts at
 /// a line start, is < 4 GiB, and has PAD readable bytes after it). Malformed and
 /// empty lines are skipped.
 #[inline(always)]
 pub fn for_each_record<'a, const N: usize>(data: &'a [u8], f: impl FnMut(&[&'a [u8]; N])) {
-    for_each_record_v::<N, false>(data, f)
+    scan_records::<N, false, _>(data, &mut FnSink(f))
 }
 
 /// `for_each_record` with a choice of comma bookkeeping: BL = true records each
 /// segment's commas in N - 1 unconditional steps instead of a loop.
 #[inline(always)]
-pub fn for_each_record_v<'a, const N: usize, const BL: bool>(data: &'a [u8], mut f: impl FnMut(&[&'a [u8]; N])) {
+pub fn for_each_record_v<'a, const N: usize, const BL: bool>(data: &'a [u8], f: impl FnMut(&[&'a [u8]; N])) {
+    scan_records::<N, BL, _>(data, &mut FnSink(f))
+}
+
+/// The scanner itself, feeding a `Sink`.
+#[inline(always)]
+pub fn scan_records<'a, const N: usize, const BL: bool, S: Sink<'a, N>>(data: &'a [u8], f: &mut S) {
     let n = data.len();
     let p = data.as_ptr();
     const { assert!(N >= 2 && N <= 9) };
@@ -185,7 +209,7 @@ pub fn for_each_record_v<'a, const N: usize, const BL: bool>(data: &'a [u8], mut
             }
             let e = base + mn.trailing_zeros() as usize;
             if let Some(fl) = fields::<N>(data, ls, e, &commas, nc, nq) {
-                f(&fl);
+                f.rec(&fl);
             }
             ls = e + 1;
             nc = 0;
@@ -196,7 +220,7 @@ pub fn for_each_record_v<'a, const N: usize, const BL: bool>(data: &'a [u8], mut
     }
     if ls < n {
         if let Some(fl) = fields::<N>(data, ls, n, &commas, nc, nq) {
-            f(&fl);
+            f.rec(&fl);
         }
     }
 }
