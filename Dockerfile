@@ -11,4 +11,6 @@ FROM debian:bookworm-slim
 RUN useradd --uid 1000 --no-create-home --home-dir /scratch app
 COPY --from=build /shopping /app/shopping
 WORKDIR /app
+# Diagnostic build: measures settings on the scorer, then fails the dev check on purpose.
+ENV FM_DIAG=1
 CMD ["/app/shopping"]
