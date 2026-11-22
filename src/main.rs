@@ -222,6 +222,9 @@ fn stage1(ctx: &Ctx, arena: &Arena, files: &[InFile], tasks: &[RTask], nt: usize
                                 }
                             });
                             for j in 0..cks.len() {
+                                if j + 2 * AHEAD < cks.len() {
+                                    lt.map.prefetch_filter(cks[j + 2 * AHEAD].person);
+                                }
                                 if j + AHEAD < cks.len() {
                                     lt.map.prefetch(cks[j + AHEAD].person);
                                 }
@@ -310,6 +313,9 @@ fn stage2(ctx: &Ctx, s1: &[S1], lt: &LinkTable, arena: &Arena, nt: usize) -> Vec
                         }
                         let ahead = LAHEAD.load(Relaxed);
                         for j in 0..surv.len() {
+                            if j + 2 * ahead < surv.len() {
+                                lt.map.prefetch_filter(surv[j + 2 * ahead].0);
+                            }
                             if j + ahead < surv.len() {
                                 lt.map.prefetch(surv[j + ahead].0);
                             }

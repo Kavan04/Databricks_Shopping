@@ -15,7 +15,8 @@ Goal: the top of the Shopping Sessions leaderboard. At the time of the first sub
 | v3.3 | `341b502` | **1.17 s** (same code again at `d4dc286`: 1.14 s) | exit work after the last stage: best 15 ms vs 57 ms | same suite, both platforms; 20M identical to v1 |
 | v3.4 | `5862f0d` | not submitted | same as v3.3 locally; drops `MADV_POPULATE_READ` (slower on the scorer) | full suite, both platforms; 20M identical to v1 |
 | v3.5 | `278d5a8` | not submitted | user_daily writing 0.15 to 0.18 s vs 0.19 to 0.28 s (single thread, 2.24M rows) | full suite, both platforms; 20M identical to v1; files read identically by polars, pyarrow and DuckDB, including empty tables |
-| v3.6 | see git log | not submitted yet | 512 buckets by default (best on the scorer) | full suite, both platforms; 20M identical to v1 |
+| v3.6 | `300031f` | not submitted | 512 buckets by default (best on the scorer) | full suite, both platforms; 20M identical to v1 |
+| v3.7 | see git log | not submitted yet | two-stage prefetch for person lookups: the filter word is fetched before it is checked, so the prefetch pass no longer stalls on it | full suite, both platforms; 20M identical to v1 |
 
 Local timings come from a Docker VM on an 8-core Apple-silicon Mac, with the data in `/dev/shm`. The Mac is often loaded, so one run can vary 2 to 3x. Only best-of-N is meaningful, and only the board counts.
 

@@ -239,6 +239,15 @@ impl PartMap {
             i = (i + 1) & mask;
         }
     }
+    /// First half of a two-stage prefetch: bring in the filter word for `k`.
+    /// (The filter is larger than the scorer's 1 MB L2, so checking it cold
+    /// stalls; issue this well ahead of `prefetch`.)
+    #[inline(always)]
+    pub fn prefetch_filter(&self, k: u64) {
+        let h = mix(k);
+        let part = unsafe { self.parts.get_unchecked((h >> (64 - PB)) as usize) };
+        prefetch(unsafe { part.bloom.as_ptr().add(bloom_word(h, part.wmask)) });
+    }
     /// Prefetch the table slot of `k`, unless the filter already rules it out.
     #[inline(always)]
     pub fn prefetch(&self, k: u64) {
