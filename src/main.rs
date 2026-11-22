@@ -699,17 +699,15 @@ fn sort_small<T: Copy, K: Ord>(v: &mut [T], key: impl Fn(&T) -> K) {
     }
 }
 
-/// Counting-sort the records of `segs` into `dst` by `sub(record)`; `cnt` ends
-/// up holding each group's start (nsub + 1 entries).
+/// Counting-sort the records of `srcs` (n in all) into `dst` by `sub(record)`;
+/// `cnt` ends up holding each group's start (nsub + 1 entries).
 #[inline(always)]
-fn scatter<T: Copy>(segs: &[&[Seg<T>]], n: usize, nsub: usize, sub: impl Fn(&T) -> usize, dst: &mut Vec<T>, cnt: &mut Vec<u32>, pos: &mut Vec<u32>) {
+fn scatter<T: Copy>(srcs: &[&[T]], n: usize, nsub: usize, sub: impl Fn(&T) -> usize, dst: &mut Vec<T>, cnt: &mut Vec<u32>, pos: &mut Vec<u32>) {
     cnt.clear();
     cnt.resize(nsub + 1, 0);
-    for ss in segs {
-        for sg in ss.iter() {
-            for r in sg.slice() {
-                cnt[sub(r) + 1] += 1;
-            }
+    for s in srcs {
+        for r in s.iter() {
+            cnt[sub(r) + 1] += 1;
         }
     }
     for i in 0..nsub {
@@ -720,17 +718,79 @@ fn scatter<T: Copy>(segs: &[&[Seg<T>]], n: usize, nsub: usize, sub: impl Fn(&T) 
     dst.clear();
     dst.reserve(n);
     let d = dst.as_mut_ptr();
-    for ss in segs {
-        for sg in ss.iter() {
-            for r in sg.slice() {
-                let j = sub(r);
-                unsafe { d.add(pos[j] as usize).write(*r) };
-                pos[j] += 1;
-            }
+    for s in srcs {
+        for r in s.iter() {
+            let j = sub(r);
+            unsafe { d.add(pos[j] as usize).write(*r) };
+            pos[j] += 1;
         }
     }
     unsafe { dst.set_len(n) };
 }
+
+/// Per-worker buffers of the sessions stage.
+#[derive(Default)]
+struct S3Buf {
+    ev: Vec<Ev>,
+    ck: Vec<Ck>,
+    ecnt: Vec<u32>,
+    ccnt: Vec<u32>,
+    pos: Vec<u32>,
+}
+
+/// Sessionize the events and clicks of `esrc`/`csrc` (whole persons): group
+/// them by `shift`-shifted hash bits of the person into groups of ~4 events,
+/// sort each group, and run every person through `person_proc`.
+fn sessionize(w: &mut W3, ctx: &Ctx, names: &Names, esrc: &[&[Ev]], ne: usize, csrc: &[&[Ck]], nc: usize, shift: u32, bf: &mut S3Buf) {
+    // groups of ~4 events: same person -> same group
+    let sbits = log2_ceil(ne / 4).clamp(1, 20);
+    let nsub = 1usize << sbits;
+    let sh = 64 - sbits;
+    let sub = |p: u64| ((mix(p) << shift) >> sh) as usize;
+    scatter(esrc, ne, nsub, |e: &Ev| sub(e.person), &mut bf.ev, &mut bf.ecnt, &mut bf.pos);
+    scatter(csrc, nc, nsub, |c: &Ck| sub(c.person), &mut bf.ck, &mut bf.ccnt, &mut bf.pos);
+    let (ev, ck, ecnt, ccnt) = (&mut bf.ev, &mut bf.ck, &bf.ecnt, &bf.ccnt);
+    for j in 0..nsub {
+        let (es, ee) = (ecnt[j] as usize, ecnt[j + 1] as usize);
+        if es == ee {
+            continue;
+        }
+        let evs = &mut ev[es..ee];
+        let p0 = evs[0].person;
+        let cks = &mut ck[ccnt[j] as usize..ccnt[j + 1] as usize];
+        if evs.iter().all(|e| e.person == p0) && cks.iter().all(|c| c.person == p0) {
+            // one person (the usual case): order by time alone
+            sort_small(evs, |e| e.w2);
+            sort_small(cks, |c| c.w1);
+        } else {
+            sort_small(evs, |e| (e.person, e.w2));
+            sort_small(cks, |c| (c.person, c.w1));
+        }
+        let mut ci = 0;
+        let mut i = 0;
+        while i < evs.len() {
+            let p = evs[i].person;
+            let mut e = i + 1;
+            while e < evs.len() && evs[e].person == p {
+                e += 1;
+            }
+            while ci < cks.len() && cks[ci].person < p {
+                ci += 1;
+            }
+            let mut ce = ci;
+            while ce < cks.len() && cks[ce].person == p {
+                ce += 1;
+            }
+            person_proc(w, ctx, names, &evs[i..e], &cks[ci..ce]);
+            ci = ce;
+            i = e;
+        }
+    }
+}
+
+/// Person buckets with more events than this are first split by more hash
+/// bits into pieces of about half of it, so grouping runs in L2 (FM_S3MAX).
+static S3_MAX: AtomicUsize = AtomicUsize::new(64 << 10);
 
 /// Each worker writes its own user_daily file as soon as its buckets are done.
 fn stage3(ctx: &Ctx, names: &Names, s1: &[S1], s2: &[Vec<Vec<Seg<Ev>>>], nt: usize, cats: &[&[u8]], out_dir: &Path) -> Vec<W3> {
@@ -757,9 +817,10 @@ fn stage3(ctx: &Ctx, names: &Names, s1: &[S1], s2: &[Vec<Vec<Seg<Ev>>>], nt: usi
                         catsum: vec![0; ncat.max(1)],
                         touched: Vec::new(),
                     };
-                    let mut ev: Vec<Ev> = Vec::new();
-                    let mut ck: Vec<Ck> = Vec::new();
-                    let (mut ecnt, mut ccnt, mut pos) = (Vec::new(), Vec::new(), Vec::new());
+                    let mut bf = S3Buf::default();
+                    let (mut pev, mut pck): (Vec<Ev>, Vec<Ck>) = (Vec::new(), Vec::new());
+                    let (mut pecnt, mut pccnt, mut ppos): (Vec<u32>, Vec<u32>, Vec<u32>) = (Vec::new(), Vec::new(), Vec::new());
+                    let s3_max = S3_MAX.load(Relaxed);
                     loop {
                         let k = next.fetch_add(1, Relaxed);
                         if k >= nb2 {
@@ -769,51 +830,27 @@ fn stage3(ctx: &Ctx, names: &Names, s1: &[S1], s2: &[Vec<Vec<Seg<Ev>>>], nt: usi
                         if ne == 0 {
                             continue;
                         }
-                        // groups of ~4 events: same person -> same group
-                        let sbits = log2_ceil(ne / 4).clamp(1, 20);
-                        let nsub = 1usize << sbits;
-                        let sh = 64 - sbits;
-                        let sub = |p: u64| ((mix(p) << b2bits) >> sh) as usize;
-                        let esegs: Vec<&[Seg<Ev>]> = s2.iter().map(|o| &o[b][..]).collect();
-                        scatter(&esegs, ne, nsub, |e: &Ev| sub(e.person), &mut ev, &mut ecnt, &mut pos);
-                        let csegs: Vec<&[Seg<Ck>]> = s1.iter().map(|o| &o.ck[b][..]).collect();
-                        let nc: usize = csegs.iter().map(|x| seg_len(x)).sum();
-                        scatter(&csegs, nc, nsub, |c: &Ck| sub(c.person), &mut ck, &mut ccnt, &mut pos);
-                        for j in 0..nsub {
-                            let (es, ee) = (ecnt[j] as usize, ecnt[j + 1] as usize);
-                            if es == ee {
+                        let esrc: Vec<&[Ev]> = s2.iter().flat_map(|o| o[b].iter().map(|sg| sg.slice())).collect();
+                        let csrc: Vec<&[Ck]> = s1.iter().flat_map(|o| o.ck[b].iter().map(|sg| sg.slice())).collect();
+                        let nc: usize = csrc.iter().map(|x| x.len()).sum();
+                        if ne <= s3_max {
+                            sessionize(&mut w, ctx, names, &esrc, ne, &csrc, nc, b2bits, &mut bf);
+                            continue;
+                        }
+                        // big bucket: split into pieces of whole persons first
+                        let target = (s3_max / 2).max(1);
+                        let kbits = ne.div_ceil(target).next_power_of_two().trailing_zeros().max(1);
+                        let np = 1usize << kbits;
+                        let piece = |p: u64| ((mix(p) << b2bits) >> (64 - kbits)) as usize;
+                        scatter(&esrc, ne, np, |e: &Ev| piece(e.person), &mut pev, &mut pecnt, &mut ppos);
+                        scatter(&csrc, nc, np, |c: &Ck| piece(c.person), &mut pck, &mut pccnt, &mut ppos);
+                        for q in 0..np {
+                            let es = &pev[pecnt[q] as usize..pecnt[q + 1] as usize];
+                            if es.is_empty() {
                                 continue;
                             }
-                            let evs = &mut ev[es..ee];
-                            let p0 = evs[0].person;
-                            let cks = &mut ck[ccnt[j] as usize..ccnt[j + 1] as usize];
-                            if evs.iter().all(|e| e.person == p0) && cks.iter().all(|c| c.person == p0) {
-                                // one person (the usual case): order by time alone
-                                sort_small(evs, |e| e.w2);
-                                sort_small(cks, |c| c.w1);
-                            } else {
-                                sort_small(evs, |e| (e.person, e.w2));
-                                sort_small(cks, |c| (c.person, c.w1));
-                            }
-                            let mut ci = 0;
-                            let mut i = 0;
-                            while i < evs.len() {
-                                let p = evs[i].person;
-                                let mut e = i + 1;
-                                while e < evs.len() && evs[e].person == p {
-                                    e += 1;
-                                }
-                                while ci < cks.len() && cks[ci].person < p {
-                                    ci += 1;
-                                }
-                                let mut ce = ci;
-                                while ce < cks.len() && cks[ce].person == p {
-                                    ce += 1;
-                                }
-                                person_proc(&mut w, ctx, names, &evs[i..e], &cks[ci..ce]);
-                                ci = ce;
-                                i = e;
-                            }
+                            let cs = &pck[pccnt[q] as usize..pccnt[q + 1] as usize];
+                            sessionize(&mut w, ctx, names, &[es], es.len(), &[cs], cs.len(), b2bits + kbits, &mut bf);
                         }
                     }
                     if !w.urows.is_empty() && std::env::var_os("FM_NOWRITE").is_none() {
@@ -974,6 +1011,7 @@ fn main() {
 fn run(data_dir: &Path, out_dir: &Path, nt: usize, chunk: usize) {
     let t0 = Instant::now();
     SUB_MAX.store(std::env::var("FM_SUBMAX").ok().and_then(|v| v.parse().ok()).unwrap_or(12 << 10), Relaxed);
+    S3_MAX.store(std::env::var("FM_S3MAX").ok().and_then(|v| v.parse().ok()).unwrap_or(64 << 10), Relaxed);
     mem::PLAIN_STORES.store(std::env::var_os("FM_PLAINST").is_some(), Relaxed);
     SCAN_BL.store(std::env::var_os("FM_SCANBL").is_some(), Relaxed);
     let lap = |what: &str| {

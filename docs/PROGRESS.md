@@ -20,7 +20,8 @@ Goal: the top of the Shopping Sessions leaderboard. At the time of the first sub
 | v3.8 | `2fe4a4a` | not submitted | link joining overlapped with event parsing; 512 buckets at every scale; startup without per-line allocations; unused event blocks released at the end of stage 2 | full suite, both platforms; 20M identical to v1 |
 | v3.9 | `fb3b6c7` | not submitted | 24-byte event records: push 2.5 to 5 ns per line instead of 10 to 14; single-thread total 3.46 s vs 3.53 s | full suite, both platforms; 20M identical to v1 |
 | v3.10 | `95fc882` | not submitted | Parquet streamed to disk page by page (about 90 MB less fresh memory); diagnostics switches for plain vs streaming stores and dedup-table prefetch | full suite, both platforms; 20M identical to v1 in polars, pyarrow and DuckDB |
-| v3.11 | see git log | not submitted yet | dedup buckets over 12K records split into L2-sized pieces first; purchase side records carry their ingest so the price always comes from the winning copy | full suite, both platforms, plus forced splitting (dev with `FM_SUBMAX=100`, fixtures with `FM_SUBMAX=1`) |
+| v3.11 | `74531b3` | not submitted | dedup buckets over 12K records split into L2-sized pieces first; purchase side records carry their ingest so the price always comes from the winning copy | full suite, both platforms, plus forced splitting (dev with `FM_SUBMAX=100`, fixtures with `FM_SUBMAX=1`) |
+| v3.12 | see git log | not submitted yet | sessions stage: person buckets over 64K events (the 60M scale) are first split into pieces of whole persons, so grouping runs in L2; 20M runs are unchanged | full suite, both platforms, plus forced splitting (dev with `FM_S3MAX=100`, fixtures with `FM_S3MAX=1`, 20M with `FM_S3MAX=20000` identical to v1) |
 
 Local timings come from a Docker VM on an 8-core Apple-silicon Mac, with the data in `/dev/shm`. The Mac is often loaded, so one run can vary 2 to 3x. Only best-of-N is meaningful, and only the board counts.
 
