@@ -14,9 +14,13 @@ pub fn h64(b: &[u8]) -> u64 {
     xxh3_64(b)
 }
 
+/// A bit that is 0 in every key: packed keys are ASCII bytes (high bit clear)
+/// and hashed keys have it cleared. Stage 1 uses it to flag purchases.
+pub const PFLAG: u64 = 1 << 55;
+
 #[inline(always)]
 fn tagged(f: &[u8]) -> u64 {
-    TAG | (h64(f) >> 1)
+    TAG | ((h64(f) >> 1) & !PFLAG)
 }
 
 /// Key of an ID that should start with the letter `prefix` (generator IDs are

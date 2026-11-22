@@ -44,15 +44,31 @@ const CAT_MASK: u64 = 0x1FF;
 
 // ---------------------------------------------------------------- records
 
-/// Parsed event, before dedup. `w2` = ts_rel << 33 | price << 9 | category.
-/// `ing` = (ingest_ms + 2^47) << 1 | ok. Invalid copies keep only eid + ing.
+/// Parsed event, before dedup (24 bytes).
+/// `w` = ts_rel << 33 | ingest << 1 | ok, where ingest is in whole seconds,
+/// offset so it fits 32 bits (`ingest_rel`); an invalid copy has ts_rel 0.
+/// `user` carries PFLAG for a valid purchase: its price and category are in
+/// a `Pc` record with the same event id (purchases are ~3% of events).
 #[derive(Clone, Copy, Default)]
 #[repr(C)]
 struct E1 {
     eid: u64,
     user: u64,
-    w2: u64,
-    ing: u64,
+    w: u64,
+}
+
+/// Price and category of a valid purchase: `pc` = price << 9 | category.
+#[derive(Clone, Copy, Default)]
+#[repr(C)]
+struct Pc {
+    eid: u64,
+    pc: u64,
+}
+
+/// The ingest part of `E1::w`, the dedup order.
+#[inline(always)]
+fn e1_ingest(w: u64) -> u64 {
+    (w >> 1) & 0xFFFF_FFFF
 }
 
 /// Surviving event, keyed by its person.
@@ -82,6 +98,8 @@ struct Ctx {
     /// base split into whole days and the remainder, for cheap day numbers
     base_day: i64,
     base_off: i64,
+    /// base seconds - 2^31: the zero of 32-bit ingest seconds
+    ing0: i64,
     camps: U64Map,
     ncamp: usize,
     prods: U64Map,
@@ -103,6 +121,7 @@ fn bucket(k: u64, bits: u32) -> usize {
 
 struct S1 {
     ev: Vec<Vec<Seg<E1>>>,
+    pr: Vec<Vec<Seg<Pc>>>,
     ck: Vec<Vec<Seg<Ck>>>,
     /// strings of keys that are hashes (rare), for names and click_id ties
     strs: Vec<(u64, Vec<u8>)>,
@@ -114,15 +133,17 @@ const PURCHASE: u64 = u64::from_le_bytes(*b"purchase");
 
 // ---------------------------------------------------------------- stage 1: parse
 
+/// One parsed event line: its E1 record and, for a valid purchase, its
+/// price << 9 | category (0 otherwise).
 #[inline(always)]
-fn parse_event(ctx: &Ctx, f: &[&[u8]; 7], dc: &mut DateCache, strs: &mut Vec<(u64, Vec<u8>)>) -> Option<E1> {
+fn parse_event(ctx: &Ctx, f: &[&[u8]; 7], dc: &mut DateCache, strs: &mut Vec<(u64, Vec<u8>)>) -> Option<(E1, u64)> {
     if f[0].is_empty() {
         return None;
     }
     let eid = pkey_p(f[0], b'e');
     let ing = ts_p(f[3], dc).unwrap_or(i64::MAX);
-    let ingc = (ing.clamp(-(1 << 47), (1 << 47) - 1) + (1 << 47)) as u64;
-    let bad = E1 { eid, user: 0, w2: 0, ing: ingc << 1 };
+    let ing_rel = (ing.div_euclid(1000) - ctx.ing0).clamp(0, 0xFFFF_FFFF) as u64;
+    let bad = (E1 { eid, user: 0, w: ing_rel << 1 }, 0);
     if f[1].is_empty() || f[5].is_empty() {
         return Some(bad);
     }
@@ -143,15 +164,16 @@ fn parse_event(ctx: &Ctx, f: &[&[u8]; 7], dc: &mut DateCache, strs: &mut Vec<(u6
         }
         _ => return Some(bad),
     };
-    let mut w2 = match ts_p(f[2], dc) {
-        Some(t) if t >= ctx.ws && t < ctx.we && ing.saturating_sub(t) <= LATE => ((t - ctx.base) as u64) << 33,
+    let ts_rel = match ts_p(f[2], dc) {
+        Some(t) if t >= ctx.ws && t < ctx.we && ing.saturating_sub(t) <= LATE => (t - ctx.base) as u64,
         _ => return Some(bad),
     };
+    let mut pc = 0u64;
     if purchase {
         match parse_price(f[6]) {
             Some(p) => {
                 let cat = ctx.prods.get(skey(f[5])).unwrap_or(ctx.unknown_cat);
-                w2 |= (p << 9) | cat;
+                pc = (p << 9) | cat;
             }
             None => return Some(bad),
         }
@@ -160,7 +182,8 @@ fn parse_event(ctx: &Ctx, f: &[&[u8]; 7], dc: &mut DateCache, strs: &mut Vec<(u6
     if !is_packed(user) {
         strs.push((user, f[1].to_vec()));
     }
-    Some(E1 { eid, user, w2, ing: (ingc << 1) | 1 })
+    let flag = if purchase { PFLAG } else { 0 };
+    Some((E1 { eid, user: user | flag, w: (ts_rel << 33) | (ing_rel << 1) | 1 }, pc))
 }
 
 /// A valid click with `person` still holding the user's key.
@@ -194,7 +217,8 @@ fn stage1(ctx: &Ctx, arena: &Arena, files: &[InFile], tasks: &[RTask], nt: usize
             .map(|_| {
                 s.spawn(|| {
                     let mut blocks = Blocks::new(arena);
-                    let mut ev: WcBuckets<E1, 2> = WcBuckets::new(nb1);
+                    let mut ev: WcBuckets<E1, 8> = WcBuckets::new(nb1);
+                    let mut pr: WcBuckets<Pc, 4> = WcBuckets::new(nb1);
                     let mut ck: Vec<Bkt<Ck>> = (0..nb2).map(|_| Bkt::new()).collect();
                     let mut strs = Vec::new();
                     let mut dc = DateCache::new();
@@ -211,8 +235,12 @@ fn stage1(ctx: &Ctx, arena: &Arena, files: &[InFile], tasks: &[RTask], nt: usize
                         let data = lines_in(&files[t.file], t.off, t.len);
                         if t.kind == 0 {
                             for_each_record::<7>(data, |f| {
-                                if let Some(e) = parse_event(ctx, f, &mut dc, &mut strs) {
-                                    ev.push(bucket(e.eid, ctx.b1bits), e, &mut blocks);
+                                if let Some((e, pc)) = parse_event(ctx, f, &mut dc, &mut strs) {
+                                    let b = bucket(e.eid, ctx.b1bits);
+                                    ev.push(b, e, &mut blocks);
+                                    if pc != 0 {
+                                        pr.push(b, Pc { eid: e.eid, pc }, &mut blocks);
+                                    }
                                 }
                             });
                         } else {
@@ -241,6 +269,7 @@ fn stage1(ctx: &Ctx, arena: &Arena, files: &[InFile], tasks: &[RTask], nt: usize
                     }
                     S1 {
                         ev: ev.finish(&mut blocks),
+                        pr: pr.finish(&mut blocks),
                         ck: ck.into_iter().map(|b| b.finish()).collect(),
                         strs,
                     }
@@ -265,6 +294,7 @@ fn stage2(ctx: &Ctx, s1: &[S1], lt: &LinkTable, arena: &Arena, nt: usize) -> Vec
                     let mut blocks = Blocks::new(arena);
                     let mut out: WcBuckets<Ev, 4> = WcBuckets::new(nb2);
                     let mut table: Vec<E1> = Vec::new();
+                    let mut ptab: Vec<Pc> = Vec::new();
                     let mut surv: Vec<(u64, u64)> = Vec::new();
                     loop {
                         let b = next.fetch_add(1, Relaxed);
@@ -293,7 +323,7 @@ fn stage2(ctx: &Ctx, s1: &[S1], lt: &LinkTable, arena: &Arena, nt: usize) -> Vec
                                             break;
                                         }
                                         if t.eid == r.eid {
-                                            if (r.ing >> 1) < (t.ing >> 1) {
+                                            if e1_ingest(r.w) < e1_ingest(t.w) {
                                                 *t = *r;
                                             }
                                             break;
@@ -303,14 +333,41 @@ fn stage2(ctx: &Ctx, s1: &[S1], lt: &LinkTable, arena: &Arena, nt: usize) -> Vec
                                 }
                             }
                         }
+                        // price and category of this bucket's valid purchases, by event id
+                        let np: usize = s1.iter().map(|w| seg_len(&w.pr[b])).sum();
+                        let pcap = (2 * np + 1).next_power_of_two().max(16);
+                        let (pbits, pmask) = (pcap.trailing_zeros(), pcap - 1);
+                        ptab.clear();
+                        ptab.resize(pcap, Pc::default());
+                        let pslot = |eid: u64| ((mix(eid) << b1bits) >> (64 - pbits)) as usize;
+                        for w in s1 {
+                            for sg in &w.pr[b] {
+                                for r in sg.slice() {
+                                    let mut i = pslot(r.eid);
+                                    while ptab[i].eid != 0 && ptab[i].eid != r.eid {
+                                        i = (i + 1) & pmask;
+                                    }
+                                    ptab[i] = *r;
+                                }
+                            }
+                        }
                         // this bucket's input blocks are dead now: reuse them for output
                         for w in s1 {
                             blocks.recycle(&w.ev[b]);
+                            blocks.recycle(&w.pr[b]);
                         }
                         surv.clear();
                         for t in &table {
-                            if t.ing & 1 == 1 {
-                                surv.push((t.user, t.w2));
+                            if t.w & 1 == 1 {
+                                let mut w2 = (t.w >> 33) << 33;
+                                if t.user & PFLAG != 0 {
+                                    let mut i = pslot(t.eid);
+                                    while ptab[i].eid != t.eid && ptab[i].eid != 0 {
+                                        i = (i + 1) & pmask;
+                                    }
+                                    w2 |= ptab[i].pc;
+                                }
+                                surv.push((t.user & !PFLAG, w2));
                             }
                         }
                         let ahead = LAHEAD.load(Relaxed);
@@ -732,7 +789,7 @@ fn bench(ctx: &Ctx, files: &[InFile], tasks: &[RTask]) {
             let mut strs = Vec::new();
             let mut blocks = Blocks::new(&arena);
             let bb: u32 = std::env::var("BENCH_B1").ok().and_then(|v| v.parse().ok()).unwrap_or(ctx.b1bits);
-            let mut ev: WcBuckets<E1, 2> = WcBuckets::new(1usize << bb);
+            let mut ev: WcBuckets<E1, 8> = WcBuckets::new(1usize << bb);
             let wb = if mode == 6 { &mut warm } else { &mut blocks };
             let t = Instant::now();
             let mut acc = 0u64;
@@ -742,12 +799,12 @@ fn bench(ctx: &Ctx, files: &[InFile], tasks: &[RTask]) {
                 2 => for_each_record::<7>(d, |f| acc = acc.wrapping_add(pkey_p(f[0], b'e') ^ pkey_p(f[1], b'u'))),
                 3 => for_each_record::<7>(d, |f| acc = acc.wrapping_add((ts_p(f[2], &mut dc).unwrap_or(0) ^ ts_p(f[3], &mut dc).unwrap_or(0)) as u64)),
                 4 => for_each_record::<7>(d, |f| {
-                    if let Some(e) = parse_event(ctx, f, &mut dc, &mut strs) {
-                        acc = acc.wrapping_add(e.eid ^ e.w2 ^ e.ing ^ e.user);
+                    if let Some((e, pc)) = parse_event(ctx, f, &mut dc, &mut strs) {
+                        acc = acc.wrapping_add(e.eid ^ e.w ^ e.user ^ pc);
                     }
                 }),
                 _ => for_each_record::<7>(d, |f| {
-                    if let Some(e) = parse_event(ctx, f, &mut dc, &mut strs) {
+                    if let Some((e, _)) = parse_event(ctx, f, &mut dc, &mut strs) {
                         ev.push(bucket(e.eid, bb), e, wb);
                     }
                 }),
@@ -870,7 +927,8 @@ fn run(data_dir: &Path, out_dir: &Path, nt: usize, chunk: usize) {
 
 
     let (base_day, base_off) = (base.div_euclid(DAY), base.rem_euclid(DAY));
-    let ctx = Ctx { ws, we, base, day0, ndays, base_day, base_off, camps, ncamp, prods, unknown_cat, b1bits, b2bits };
+    let ing0 = base.div_euclid(1000) - (1i64 << 31);
+    let ctx = Ctx { ws, we, base, day0, ndays, base_day, base_off, ing0, camps, ncamp, prods, unknown_cat, b1bits, b2bits };
     if std::env::var_os("BENCH").is_some() {
         bench(&ctx, &files, &tasks);
         return;
@@ -879,7 +937,7 @@ fn run(data_dir: &Path, out_dir: &Path, nt: usize, chunk: usize) {
     if let Ok(mode) = std::env::var("FM_POP") {
         // records: events 32 B each, clicks 24 B each, plus one partly filled block per bucket and worker
         let ck_bytes: usize = files.iter().zip(0..).filter(|(_, i)| tasks.iter().any(|t| t.file == *i && t.kind == 1)).map(|(f, _)| f.size).sum();
-        let need = est_rows * 32 + ck_bytes / 45 * 24 + ((1usize << b1bits) + (1usize << b2bits)) * nt * BLK;
+        let need = est_rows * 25 + ck_bytes / 45 * 24 + ((1usize << b1bits) + (1usize << b2bits)) * nt * BLK;
         arena.prepopulate(need + need / 16, nt, mode == "huge");
         lap("prepopulated");
     }

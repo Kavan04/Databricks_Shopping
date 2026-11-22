@@ -340,7 +340,7 @@ mod tests {
             let mut text = Vec::new();
             let lines = 1 + rnd(40);
             for _ in 0..lines {
-                let len = rnd(90);
+                let len = if rnd(10) == 0 { 100 + rnd(200) } else { rnd(90) };
                 for _ in 0..len {
                     text.push(b"ab,,\"\"x\r 9"[rnd(10) as usize]);
                 }
@@ -391,11 +391,12 @@ mod tests {
             let mut text = Vec::new();
             for _ in 0..1 + rnd(30) {
                 let nf = 5 + rnd(4);
+                let long = rnd(8) == 0;
                 for k in 0..nf {
                     if k > 0 {
                         text.push(b',');
                     }
-                    let v: Vec<u8> = (0..rnd(12)).map(|_| b"abc0\r \""[rnd(7) as usize]).collect();
+                    let v: Vec<u8> = (0..rnd(if long { 40 } else { 12 })).map(|_| b"abc0\r \""[rnd(7) as usize]).collect();
                     match rnd(5) {
                         0 => {
                             text.push(b'"');

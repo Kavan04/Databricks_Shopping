@@ -17,7 +17,8 @@ Goal: the top of the Shopping Sessions leaderboard. At the time of the first sub
 | v3.5 | `278d5a8` | not submitted | user_daily writing 0.15 to 0.18 s vs 0.19 to 0.28 s (single thread, 2.24M rows) | full suite, both platforms; 20M identical to v1; files read identically by polars, pyarrow and DuckDB, including empty tables |
 | v3.6 | `300031f` | not submitted | 512 buckets by default (best on the scorer) | full suite, both platforms; 20M identical to v1 |
 | v3.7 | `2ea5cf5` | not submitted | two-stage prefetch for person lookups: the filter word is fetched before it is checked, so the prefetch pass no longer stalls on it | full suite, both platforms; 20M identical to v1 |
-| v3.8 | see git log | not submitted yet | link joining overlapped with event parsing; 512 buckets at every scale; startup without per-line allocations; unused event blocks released at the end of stage 2 | full suite, both platforms; 20M identical to v1 |
+| v3.8 | `2fe4a4a` | not submitted | link joining overlapped with event parsing; 512 buckets at every scale; startup without per-line allocations; unused event blocks released at the end of stage 2 | full suite, both platforms; 20M identical to v1 |
+| v3.9 | see git log | not submitted yet | 24-byte event records: push 2.5 to 5 ns per line instead of 10 to 14; single-thread total 3.46 s vs 3.53 s | full suite, both platforms; 20M identical to v1 |
 
 Local timings come from a Docker VM on an 8-core Apple-silicon Mac, with the data in `/dev/shm`. The Mac is often loaded, so one run can vary 2 to 3x. Only best-of-N is meaningful, and only the board counts.
 
@@ -119,6 +120,19 @@ Each variant runs in its own child process, so W includes exit and teardown (20x
 | 2048 + pre-fault | 3.518 |
 
 Process exit after the last lap is now about 10 ms. At 20M the stages take: parse 0.52 s, dedup 0.21 s, sessions 0.21 s, links 0.06 s, startup 0.025 s, release and campaign table 0.03 s.
+
+## v3.9: 24-byte event records
+
+The scorer profile charged 13% of all CPU to the first writes of fresh memory for stage 1 records. The 32-byte `E1` is now 24 bytes:
+* eid
+* user
+* `ts_rel << 33 | ingest_seconds << 1 | ok`, with ingest in 32 bits (whole seconds, as F1 guarantees)
+
+A valid purchase sets a spare bit in the user key. That bit is always 0: packed keys are ASCII bytes, and hashed keys have it cleared. Its price and category go to a 16-byte side record in the same event_id bucket, which stage 2 looks up only for surviving purchases.
+
+The result is 25% less fresh memory to fault in, write and read back. Write-combining now handles line groups of any whole number of cache lines (8 events = 192 bytes).
+
+Tried and dropped: a line-by-line scanner on 128-bit masks with branch-free quote bits. It was slower here: 45.8 vs 42.4 ns per parsed line, because the 128-bit window work costs more than the byte loads it saves.
 
 ## Where the time goes
 

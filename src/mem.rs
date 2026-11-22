@@ -220,17 +220,35 @@ impl<T: Copy> Bkt<T> {
         self.cur = p;
         self.end = unsafe { p.add(BLK / std::mem::size_of::<T>()) };
     }
-    /// Append one full 64-byte line of records (`R` of them) with a
-    /// non-temporal store. The bucket must have received only whole lines so far.
+    /// Append one full line group of `R` records (a multiple of 64 bytes) with
+    /// non-temporal stores. The bucket must have received only whole groups so far.
     #[inline(always)]
     fn push_line<const R: usize>(&mut self, line: &Line<T, R>, b: &mut Blocks) {
         if self.cur == self.end {
-            self.refill(b);
+            self.refill_lines::<R>(b);
         }
         unsafe {
-            store_line(self.cur as *mut u8, line as *const Line<T, R> as *const u8);
+            let bytes = R * std::mem::size_of::<T>();
+            let (d, s) = (self.cur as *mut u8, line as *const Line<T, R> as *const u8);
+            let mut o = 0;
+            while o < bytes {
+                store_line(d.add(o), s.add(o));
+                o += 64;
+            }
             self.cur = self.cur.add(R);
         }
+    }
+    #[cold]
+    #[inline(never)]
+    fn refill_lines<const R: usize>(&mut self, b: &mut Blocks) {
+        if !self.start.is_null() {
+            self.done.push(Seg { p: self.start, n: unsafe { self.cur.offset_from(self.start) } as usize });
+        }
+        let p = b.get() as *mut T;
+        self.start = p;
+        self.cur = p;
+        // whole line groups only, so every group starts 64-byte aligned
+        self.end = unsafe { p.add(BLK / (R * std::mem::size_of::<T>()) * R) };
     }
     pub fn finish(mut self) -> Vec<Seg<T>> {
         if !self.start.is_null() && self.cur != self.start {
@@ -244,7 +262,7 @@ pub fn seg_len<T>(v: &[Seg<T>]) -> usize {
     v.iter().map(|s| s.n).sum()
 }
 
-/// One cache line of records.
+/// One group of records filling whole cache lines.
 #[derive(Clone, Copy)]
 #[repr(C, align(64))]
 pub struct Line<T: Copy, const R: usize>([T; R]);
@@ -302,8 +320,8 @@ fn store_fence() {
 }
 
 /// A set of buckets fed through software write-combining: each bucket gathers
-/// one cache line of records (R of them, R * size_of::<T>() == 64) in a small
-/// hot buffer, and full lines go out with a non-temporal store. Scattering
+/// one line group of records (R of them, R * size_of::<T>() a multiple of 64)
+/// in a small hot buffer, and full groups go out with non-temporal stores. Scattering
 /// into a thousand buckets otherwise misses the cache on almost every store.
 pub struct WcBuckets<T: Copy, const R: usize> {
     lines: Vec<Line<T, R>>,
@@ -313,7 +331,7 @@ pub struct WcBuckets<T: Copy, const R: usize> {
 
 impl<T: Copy + Default, const R: usize> WcBuckets<T, R> {
     pub fn new(n: usize) -> Self {
-        assert!(R * std::mem::size_of::<T>() == 64 && BLK % 64 == 0);
+        assert!((R * std::mem::size_of::<T>()) % 64 == 0 && BLK % 64 == 0);
         WcBuckets { lines: vec![Line([T::default(); R]); n], fill: vec![0; n], bkts: (0..n).map(|_| Bkt::new()).collect() }
     }
     #[inline(always)]
