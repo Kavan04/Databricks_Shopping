@@ -15,6 +15,9 @@ use std::fs::File;
 
 pub const PAD: usize = 64;
 
+/// Software prefetch distance for scanned input, in bytes (0 = off; FM_PF).
+pub static PF_DIST: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 /// (comma, quote, newline) masks for the 64 bytes at `p`; bit i is byte i.
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 #[inline(always)]
@@ -173,7 +176,11 @@ pub fn scan_records<'a, const N: usize, const BL: bool, S: Sink<'a, N>>(data: &'
     let mut nq = 0u32;
     let mut ls = 0usize;
     let mut base = 0usize;
+    let pf = PF_DIST.load(std::sync::atomic::Ordering::Relaxed);
     while base < n {
+        if pf != 0 {
+            crate::keys::prefetch(unsafe { p.add(base + pf) });
+        }
         let (mut mc, mut mq, mut mn) = unsafe { masks(p.add(base)) };
         if n - base < 64 {
             let keep = (1u64 << (n - base)) - 1;

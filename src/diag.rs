@@ -565,13 +565,15 @@ pub fn main(data_dir: &Path, nt: usize, run: &dyn Fn(&Path, &Path, usize)) {
     let variants: Vec<(&str, Vec<(&str, &str)>)> = vec![
         ("base", vec![]),
         ("scanbl", vec![("FM_SCANBL", "1")]),
+        ("pf1k", vec![("FM_PF", "1024")]),
+        ("s3div16", vec![("FM_S3DIV", "16")]),
         ("s3-24k", vec![("FM_S3MAX", "24576")]),
         ("nosub", vec![("FM_SUBMAX", "100000000")]),
-        ("plainst", vec![("FM_PLAINST", "1")]),
-        ("lnk2", vec![("FM_LINK_THREADS", "2")]),
+        ("b9/10", vec![("FM_B2", "10")]),
         ("base2", vec![]),
         ("scanbl2", vec![("FM_SCANBL", "1")]),
-        ("s3-24k2", vec![("FM_S3MAX", "24576")]),
+        ("pf1k2", vec![("FM_PF", "1024")]),
+        ("s3div162", vec![("FM_S3DIV", "16")]),
     ];
     // the first run after tiling pays for the fresh files: warm up, then measure
     lines.push(format!("V warmup  {}", run_child(&t20, &out, nt, &[], run)));

@@ -776,8 +776,8 @@ struct S3Buf {
 /// them by `shift`-shifted hash bits of the person into groups of ~4 events,
 /// sort each group, and run every person through `person_proc`.
 fn sessionize(w: &mut W3, ctx: &Ctx, names: &Names, esrc: &[&[Ev]], ne: usize, csrc: &[&[Ck]], nc: usize, shift: u32, bf: &mut S3Buf) {
-    // groups of ~4 events: same person -> same group
-    let sbits = log2_ceil(ne / 4).clamp(1, 20);
+    // groups of ~4 events (FM_S3DIV): same person -> same group
+    let sbits = log2_ceil(ne / S3_DIV.load(Relaxed)).clamp(1, 20);
     let nsub = 1usize << sbits;
     let sh = 64 - sbits;
     let sub = |p: u64| ((mix(p) << shift) >> sh) as usize;
@@ -822,6 +822,9 @@ fn sessionize(w: &mut W3, ctx: &Ctx, names: &Names, esrc: &[&[Ev]], ne: usize, c
     }
 }
 
+/// Events per group in the sessions stage's counting sort (FM_S3DIV).
+static S3_DIV: AtomicUsize = AtomicUsize::new(4);
+
 /// Person buckets with more events than this are first split by more hash
 /// bits into pieces of about half of it, so grouping runs in L2 (FM_S3MAX).
 static S3_MAX: AtomicUsize = AtomicUsize::new(64 << 10);
@@ -835,6 +838,7 @@ fn stage3(ctx: &Ctx, names: &Names, s1: &[S1], s2: &[Vec<Vec<Seg<Ev>>>], nt: usi
     // biggest buckets first, so a whale's bucket does not finish last
     let mut order: Vec<(usize, usize)> = (0..nb2).map(|b| (s2.iter().map(|o| seg_len(&o[b])).sum(), b)).collect();
     order.sort_unstable_by(|a, b| b.cmp(a));
+    let total_ev: usize = order.iter().map(|x| x.0).sum();
     let next = AtomicUsize::new(0);
     thread::scope(|s| {
         let hs: Vec<_> = (0..nt)
@@ -844,7 +848,8 @@ fn stage3(ctx: &Ctx, names: &Names, s1: &[S1], s2: &[Vec<Vec<Seg<Ev>>>], nt: usi
                 s.spawn(move || {
                     let mut w = W3 {
                         cstat: vec![0; (ncamp + 1) * ctx.ndays * 4],
-                        urows: Vec::new(),
+                        // about one row per 8 events (2.3M rows for 19.5M events at 20M)
+                        urows: Vec::with_capacity(total_ev / 8 / nt + 1024),
                         cnt: vec![0; ncamp + 1],
                         pos: vec![0; ncamp + 1],
                         present: Vec::new(),
@@ -1051,9 +1056,11 @@ fn run(data_dir: &Path, out_dir: &Path, nt: usize, chunk: usize) {
     let t0 = Instant::now();
     SUB_MAX.store(std::env::var("FM_SUBMAX").ok().and_then(|v| v.parse().ok()).unwrap_or(8 << 10), Relaxed);
     S3_MAX.store(std::env::var("FM_S3MAX").ok().and_then(|v| v.parse().ok()).unwrap_or(64 << 10), Relaxed);
+    S3_DIV.store(std::env::var("FM_S3DIV").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(4).max(1), Relaxed);
     mem::PLAIN_STORES.store(std::env::var_os("FM_PLAINST").is_some(), Relaxed);
     SCAN_BL.store(std::env::var_os("FM_SCANBL").is_some(), Relaxed);
     TAB_X4.store(std::env::var_os("FM_TABX4").is_some(), Relaxed);
+    scan::PF_DIST.store(std::env::var("FM_PF").ok().and_then(|v| v.parse().ok()).unwrap_or(0), Relaxed);
     let lap = |what: &str| {
         if diag::QUIET.load(Relaxed) {
             diag::LAPS.lock().unwrap().push((what.to_string(), t0.elapsed().as_secs_f64()));
