@@ -24,7 +24,8 @@ Goal: the top of the Shopping Sessions leaderboard. At the time of the first sub
 | v3.12 | `f773190` | not submitted | sessions stage: person buckets over 64K events (the 60M scale) are first split into pieces of whole persons, so grouping runs in L2; 20M runs are unchanged | full suite, both platforms, plus forced splitting (dev with `FM_S3MAX=100`, fixtures with `FM_S3MAX=1`, 20M with `FM_S3MAX=20000` identical to v1) |
 | v3.13 | `0428491` | not submitted | event and click parsers compiled into the scanner loop (no call per line); `ingest_ts` fast path (always valid F1 by the rules); single-thread stage 1 about 12% faster locally | full suite, both platforms; new unit test for the ingest parser |
 | v3.14 | `33a4b24` | not submitted | field splitting without branches on field length (x86 had a compare and jump per field for length <= 1; an empty price is common and unpredictable) | full suite, both platforms |
-| v3.15 | see git log | not submitted yet | branch-free linked-ID lookup and prefetch, branch-free dedup winner collection: single-thread dedup 0.81-0.95 s -> 0.60-0.69 s locally; clicks use the same lookup | full suite, both platforms; new unit test for the lookup |
+| v3.15 | `14060e9` | not submitted | branch-free linked-ID lookup and prefetch, branch-free dedup winner collection: single-thread dedup 0.81-0.95 s -> 0.60-0.69 s locally; clicks use the same lookup | full suite, both platforms; new unit test for the lookup |
+| v3.16 | see git log | not submitted yet | dedup tables at load <= 1/2 (was 3/4), split threshold 8K so tables stay at 384 KB: single-thread dedup 0.60-0.66 s -> 0.55-0.60 s locally | full suite, both platforms |
 
 Local timings come from a Docker VM on an 8-core Apple-silicon Mac, with the data in `/dev/shm`. The Mac is often loaded, so one run can vary 2 to 3x. Only best-of-N is meaningful, and only the board counts.
 

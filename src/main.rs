@@ -316,16 +316,20 @@ fn stage1(ctx: &Ctx, arena: &Arena, files: &[InFile], tasks: &[RTask], nt: usize
 // ---------------------------------------------------------------- stage 2: dedup
 
 /// Returns, per worker, per person bucket, the segments it wrote.
-/// Dedup tables take at most this many records: 16K slots of 24 bytes (384 KB)
-/// stay in L2. Bigger buckets are first split by more hash bits into pieces
-/// of about 2/3 of this (FM_SUBMAX).
-static SUB_MAX: AtomicUsize = AtomicUsize::new(12 << 10);
+/// Dedup tables take at most this many records: at load <= 1/2 that is 16K
+/// slots of 24 bytes (384 KB), which stay in L2. Bigger buckets are first split
+/// by more hash bits into pieces of about 2/3 of this (FM_SUBMAX).
+static SUB_MAX: AtomicUsize = AtomicUsize::new(8 << 10);
 
-/// log2 of the dedup table size for `m` records (load at most 3/4).
+/// log2 of the dedup table size for `m` records: load at most 1/2 (FM_TABX4
+/// for 1/4), so most inserts find their home slot free or holding their own
+/// event id, and the probe branch is predictable.
 #[inline(always)]
 fn tab_bits(m: usize) -> u32 {
-    (m + m / 3 + 1).next_power_of_two().max(16).trailing_zeros()
+    let f = if TAB_X4.load(Relaxed) { 4 } else { 2 };
+    (f * m + 1).next_power_of_two().max(16).trailing_zeros()
 }
+static TAB_X4: AtomicBool = AtomicBool::new(false);
 
 /// Insert records into an open-addressing table keyed by event id, keeping the
 /// copy with the smallest ingest. `shift` = hash bits already spent choosing
@@ -1045,10 +1049,11 @@ fn main() {
 /// The whole pipeline: `data_dir` in, both tables written under `out_dir`.
 fn run(data_dir: &Path, out_dir: &Path, nt: usize, chunk: usize) {
     let t0 = Instant::now();
-    SUB_MAX.store(std::env::var("FM_SUBMAX").ok().and_then(|v| v.parse().ok()).unwrap_or(12 << 10), Relaxed);
+    SUB_MAX.store(std::env::var("FM_SUBMAX").ok().and_then(|v| v.parse().ok()).unwrap_or(8 << 10), Relaxed);
     S3_MAX.store(std::env::var("FM_S3MAX").ok().and_then(|v| v.parse().ok()).unwrap_or(64 << 10), Relaxed);
     mem::PLAIN_STORES.store(std::env::var_os("FM_PLAINST").is_some(), Relaxed);
     SCAN_BL.store(std::env::var_os("FM_SCANBL").is_some(), Relaxed);
+    TAB_X4.store(std::env::var_os("FM_TABX4").is_some(), Relaxed);
     let lap = |what: &str| {
         if diag::QUIET.load(Relaxed) {
             diag::LAPS.lock().unwrap().push((what.to_string(), t0.elapsed().as_secs_f64()));
