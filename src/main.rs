@@ -20,7 +20,7 @@ mod scan;
 use std::collections::HashMap;
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
 use std::sync::OnceLock;
 use std::thread;
 use std::time::Instant;
@@ -209,6 +209,8 @@ fn parse_click(ctx: &Ctx, f: &[&[u8]; 4], dc: &mut DateCache, strs: &mut Vec<(u6
 const AHEAD: usize = 16;
 /// Lookahead of stage 2's person lookups.
 static LAHEAD: AtomicUsize = AtomicUsize::new(32);
+/// Event lines use the scanner's unconditional comma bookkeeping (FM_SCANBL).
+static SCAN_BL: AtomicBool = AtomicBool::new(false);
 
 fn stage1(ctx: &Ctx, arena: &Arena, files: &[InFile], tasks: &[RTask], nt: usize, lt_cell: &OnceLock<LinkTable>) -> Vec<S1> {
     let next = AtomicUsize::new(0);
@@ -236,7 +238,7 @@ fn stage1(ctx: &Ctx, arena: &Arena, files: &[InFile], tasks: &[RTask], nt: usize
                         let t = &tasks[i];
                         let data = lines_in(&files[t.file], t.off, t.len);
                         if t.kind == 0 {
-                            for_each_record::<7>(data, |f| {
+                            let mut cb = |f: &[&[u8]; 7]| {
                                 if let Some((e, pc)) = parse_event(ctx, f, &mut dc, &mut strs) {
                                     let b = bucket(e.eid, ctx.b1bits);
                                     ev.push(b, e, &mut blocks);
@@ -244,7 +246,12 @@ fn stage1(ctx: &Ctx, arena: &Arena, files: &[InFile], tasks: &[RTask], nt: usize
                                         pr.push(b, Pc { eid: e.eid, pc, ing: e1_ingest(e.w) }, &mut blocks);
                                     }
                                 }
-                            });
+                            };
+                            if SCAN_BL.load(Relaxed) {
+                                for_each_record_v::<7, true>(data, &mut cb);
+                            } else {
+                                for_each_record_v::<7, false>(data, &mut cb);
+                            }
                         } else {
                             let lt = lt_cell.wait();
                             cks.clear();
@@ -883,23 +890,32 @@ fn bench(ctx: &Ctx, files: &[InFile], tasks: &[RTask]) {
     let arena = Arena::new();
     let mut warm = Blocks::new(&arena);
     let mut res = Vec::new();
-    for mode in 0..7 {
+    const NAMES: [&str; 9] = ["memchr-nl", "records", "records-bl", "+2 keys", "+2 ts", "parse_event", "parse_event-bl", "+push (fresh memory)", "+push (recycled memory)"];
+    let mut ns = Vec::new();
+    let reps = if diag::QUIET.load(Relaxed) { 3 } else { 5 };
+    for mode in 0..NAMES.len() {
         let mut best = f64::MAX;
-        for _ in 0..5 {
+        for _ in 0..reps {
             let mut dc = DateCache::new();
             let mut strs = Vec::new();
             let mut blocks = Blocks::new(&arena);
             let bb: u32 = std::env::var("BENCH_B1").ok().and_then(|v| v.parse().ok()).unwrap_or(ctx.b1bits);
             let mut ev: WcBuckets<E1, 8> = WcBuckets::new(1usize << bb);
-            let wb = if mode == 6 { &mut warm } else { &mut blocks };
+            let wb = if mode == 8 { &mut warm } else { &mut blocks };
             let t = Instant::now();
             let mut acc = 0u64;
             match mode {
                 0 => acc = memchr::memchr_iter(b'\n', d).count() as u64,
-                1 => for_each_record::<7>(d, |f| acc = acc.wrapping_add(f[2].len() as u64)),
-                2 => for_each_record::<7>(d, |f| acc = acc.wrapping_add(pkey_p(f[0], b'e') ^ pkey_p(f[1], b'u'))),
-                3 => for_each_record::<7>(d, |f| acc = acc.wrapping_add((ts_p(f[2], &mut dc).unwrap_or(0) ^ ts_p(f[3], &mut dc).unwrap_or(0)) as u64)),
-                4 => for_each_record::<7>(d, |f| {
+                1 => for_each_record_v::<7, false>(d, |f| acc = acc.wrapping_add(f[2].len() as u64)),
+                2 => for_each_record_v::<7, true>(d, |f| acc = acc.wrapping_add(f[2].len() as u64)),
+                3 => for_each_record::<7>(d, |f| acc = acc.wrapping_add(pkey_p(f[0], b'e') ^ pkey_p(f[1], b'u'))),
+                4 => for_each_record::<7>(d, |f| acc = acc.wrapping_add((ts_p(f[2], &mut dc).unwrap_or(0) ^ ts_p(f[3], &mut dc).unwrap_or(0)) as u64)),
+                5 => for_each_record_v::<7, false>(d, |f| {
+                    if let Some((e, pc)) = parse_event(ctx, f, &mut dc, &mut strs) {
+                        acc = acc.wrapping_add(e.eid ^ e.w ^ e.user ^ pc);
+                    }
+                }),
+                6 => for_each_record_v::<7, true>(d, |f| {
                     if let Some((e, pc)) = parse_event(ctx, f, &mut dc, &mut strs) {
                         acc = acc.wrapping_add(e.eid ^ e.w ^ e.user ^ pc);
                     }
@@ -912,13 +928,19 @@ fn bench(ctx: &Ctx, files: &[InFile], tasks: &[RTask]) {
             }
             std::hint::black_box(acc);
             best = best.min(t.elapsed().as_secs_f64());
-            if mode == 6 {
+            if mode == 8 {
                 for segs in ev.finish(&mut warm) {
                     warm.recycle(&segs);
                 }
             }
         }
-        res.push(format!("{}: {:.0} MB/s {:.1} ns/line", ["memchr-nl", "records", "+2 keys", "+2 ts", "parse_event", "+push (fresh memory)", "+push (recycled memory)"][mode], d.len() as f64 / best / 1e6, best * 1e9 / lines as f64));
+        ns.push(best * 1e9 / lines as f64);
+        res.push(format!("{}: {:.0} MB/s {:.1} ns/line", NAMES[mode], d.len() as f64 / best / 1e6, best * 1e9 / lines as f64));
+    }
+    if diag::QUIET.load(Relaxed) {
+        let v: Vec<String> = ns.iter().map(|x| format!("{:.1}", x)).collect();
+        *diag::BENCH_OUT.lock().unwrap() = format!("nl {} rec {}/{} keys {} ts {} pe {}/{} push {}/{} ns/line ({} lines)", v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8], lines);
+        return;
     }
     eprintln!("bench on {} MB, {} lines:\n  {}", d.len() >> 20, lines, res.join("\n  "));
 }
@@ -953,6 +975,7 @@ fn run(data_dir: &Path, out_dir: &Path, nt: usize, chunk: usize) {
     let t0 = Instant::now();
     SUB_MAX.store(std::env::var("FM_SUBMAX").ok().and_then(|v| v.parse().ok()).unwrap_or(12 << 10), Relaxed);
     mem::PLAIN_STORES.store(std::env::var_os("FM_PLAINST").is_some(), Relaxed);
+    SCAN_BL.store(std::env::var_os("FM_SCANBL").is_some(), Relaxed);
     let lap = |what: &str| {
         if diag::QUIET.load(Relaxed) {
             diag::LAPS.lock().unwrap().push((what.to_string(), t0.elapsed().as_secs_f64()));

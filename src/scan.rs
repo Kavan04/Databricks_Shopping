@@ -96,7 +96,7 @@ unsafe fn masks(p: *const u8) -> (u64, u64, u64) {
 /// and the line's quote count must equal two per quoted field (so no quote
 /// appears anywhere else).
 #[inline(always)]
-fn fields<'a, const N: usize>(d: &'a [u8], s0: usize, e0: usize, commas: &[u32; 8], nc: usize, nq: u32) -> Option<[&'a [u8]; N]> {
+fn fields<'a, const N: usize>(d: &'a [u8], s0: usize, e0: usize, commas: &[u32; 16], nc: usize, nq: u32) -> Option<[&'a [u8]; N]> {
     if nc != N - 1 {
         return None;
     }
@@ -131,10 +131,18 @@ fn fields<'a, const N: usize>(d: &'a [u8], s0: usize, e0: usize, commas: &[u32; 
 /// a line start, is < 4 GiB, and has PAD readable bytes after it). Malformed and
 /// empty lines are skipped.
 #[inline(always)]
-pub fn for_each_record<'a, const N: usize>(data: &'a [u8], mut f: impl FnMut(&[&'a [u8]; N])) {
+pub fn for_each_record<'a, const N: usize>(data: &'a [u8], f: impl FnMut(&[&'a [u8]; N])) {
+    for_each_record_v::<N, false>(data, f)
+}
+
+/// `for_each_record` with a choice of comma bookkeeping: BL = true records each
+/// segment's commas in N - 1 unconditional steps instead of a loop.
+#[inline(always)]
+pub fn for_each_record_v<'a, const N: usize, const BL: bool>(data: &'a [u8], mut f: impl FnMut(&[&'a [u8]; N])) {
     let n = data.len();
     let p = data.as_ptr();
-    let mut commas = [0u32; 8];
+    const { assert!(N >= 2 && N <= 9) };
+    let mut commas = [0u32; 16];
     let mut nc = 0usize;
     let mut nq = 0u32;
     let mut ls = 0usize;
@@ -151,12 +159,24 @@ pub fn for_each_record<'a, const N: usize>(data: &'a [u8], mut f: impl FnMut(&[&
             let below = if mn != 0 { (mn & mn.wrapping_neg()) - 1 } else { u64::MAX };
             let mut c = mc & below;
             mc &= !below;
-            while c != 0 {
-                if nc < 8 {
-                    commas[nc] = (base + c.trailing_zeros() as usize) as u32;
+            // A line with more than N - 1 commas is malformed wherever they are,
+            // so only the first N - 1 positions are kept; entries past `nc` are
+            // never read. BL avoids the loop exit the predictor cannot guess.
+            if BL {
+                let k0 = nc.min(N - 1);
+                nc += c.count_ones() as usize;
+                for j in 0..N - 1 {
+                    unsafe { *commas.get_unchecked_mut(k0 + j) = (base as u32).wrapping_add(c.trailing_zeros()) };
+                    c &= c.wrapping_sub(1);
                 }
-                nc += 1;
-                c &= c - 1;
+            } else {
+                while c != 0 {
+                    if nc < N - 1 {
+                        unsafe { *commas.get_unchecked_mut(nc) = (base + c.trailing_zeros() as usize) as u32 };
+                    }
+                    nc += 1;
+                    c &= c - 1;
+                }
             }
             nq += (mq & below).count_ones();
             mq &= !below;
