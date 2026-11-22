@@ -14,7 +14,8 @@ Goal: the top of the Shopping Sessions leaderboard. At the time of the first sub
 | v3.2 | `6f6ed83` | not submitted | single-thread work 3.73 s vs 4.14 s for v3.1 (interleaved, min of 6) | unit tests, fixtures, dev (also 997 / 64-byte ranges) on arm64 and amd64; 20M identical to v1 |
 | v3.3 | `341b502` | **1.17 s** (same code again at `d4dc286`: 1.14 s) | exit work after the last stage: best 15 ms vs 57 ms | same suite, both platforms; 20M identical to v1 |
 | v3.4 | `5862f0d` | not submitted | same as v3.3 locally; drops `MADV_POPULATE_READ` (slower on the scorer) | full suite, both platforms; 20M identical to v1 |
-| v3.5 | see git log | not submitted yet | user_daily writing 0.15 to 0.18 s vs 0.19 to 0.28 s (single thread, 2.24M rows) | full suite, both platforms; 20M identical to v1; files read identically by polars, pyarrow and DuckDB, including empty tables |
+| v3.5 | `278d5a8` | not submitted | user_daily writing 0.15 to 0.18 s vs 0.19 to 0.28 s (single thread, 2.24M rows) | full suite, both platforms; 20M identical to v1; files read identically by polars, pyarrow and DuckDB, including empty tables |
+| v3.6 | see git log | not submitted yet | 512 buckets by default (best on the scorer) | full suite, both platforms; 20M identical to v1 |
 
 Local timings come from a Docker VM on an 8-core Apple-silicon Mac, with the data in `/dev/shm`. The Mac is often loaded, so one run can vary 2 to 3x. Only best-of-N is meaningful, and only the board counts.
 
@@ -66,6 +67,34 @@ This drops the parquet crate and its dependency tree. Checks:
 * Empty tables are valid in all three, and in the starter's fixture loader.
 
 The direct timing shows writing was about 4% of single-thread work, not the 10% an earlier noisy estimate suggested. So this is a small win.
+
+## Scorer profile and settings (diagnostic v2)
+
+Machine: Intel Xeon @ 2.80 GHz, L1d 32K, L2 1 MB, L3 33 MB; THP `madvise`; 8 vCPUs.
+
+Settings, each a full run on the 20x tiled dev set (20M events); W excludes process exit:
+
+| Variant | Total | Note |
+| --- | --- | --- |
+| 1024 buckets (old default) | 1.048 / 1.057 / 1.057 | |
+| **512 buckets** | **1.033** | best of the bucket counts; now the default (v3.6) |
+| 2048 / 4096 buckets | 1.099 / 1.144 | worse |
+| 1 MB / 16 MB ranges | 1.077 / 1.053 | no difference |
+| 16 threads | 1.096 | worse |
+| no early release | 1.011 | 40 ms less in the measured window, but exit teardown not measured; diag v3 measures it |
+
+Sampling profile of a default run (2301 samples of CPU time), hottest:
+
+| Share | Where | Reading |
+| --- | --- | --- |
+| 13% | `mem.rs store_line` | first write to fresh arena pages: page faults charged to the store |
+| 8.5% | `scan.rs fields` | per-field quote checks |
+| 8.8% | `main.rs` stage closures | |
+| 5.8% | `scan.rs` stage 1 loop | |
+| 5.3% | `ts_p` | timestamps |
+| 5% + 3.7% | `PartMap::get` + Bloom `maybe` | person lookups; the 1.8 MB Bloom filter misses the 1 MB L2 |
+| 3.8% | `person_proc` | sessions |
+| 3.1% | `madvise` | early release |
 
 ## Where the time goes
 

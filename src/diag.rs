@@ -308,6 +308,19 @@ fn shift_line(line: &mut [u8], r: usize) {
                         let nv = (v as usize + r) % 36;
                         line[e - 1] = if nv < 10 { b'0' + nv as u8 } else { b'a' + nv as u8 - 10 };
                     }
+                    // replicas 36.. also shift the second-last character
+                    if r >= 36 && e >= s + 3 {
+                        let c = line[e - 2];
+                        let v = match c {
+                            b'0'..=b'9' => Some(c - b'0'),
+                            b'a'..=b'z' => Some(c - b'a' + 10),
+                            _ => None,
+                        };
+                        if let Some(v) = v {
+                            let nv = (v as usize + r / 36) % 36;
+                            line[e - 2] = if nv < 10 { b'0' + nv as u8 } else { b'a' + nv as u8 - 10 };
+                        }
+                    }
                 }
             }
             k += 1;
@@ -433,68 +446,103 @@ fn facts() -> String {
     format!("D {} | {} | thp {} | n={:?}", m, caches.join(" "), thp, std::thread::available_parallelism().map(|n| n.get()).ok())
 }
 
-pub fn main(data_dir: &Path, nt: usize, run: &dyn Fn(&Path, &Path, usize)) {
-    let t0 = Instant::now();
-    let scratch = std::path::PathBuf::from(std::env::var("SCRATCH_DIR").unwrap_or("/scratch".into()));
-    let reps: usize = std::env::var("FM_DIAG_REPS").ok().and_then(|v| v.parse().ok()).unwrap_or(20);
-    let tiled = scratch.join("tiled");
-    let (bytes, te, _, _) = timed(|| tile(data_dir, &tiled, reps, nt));
-    QUIET.store(true, Relaxed);
-    let mut lines = vec![format!("T tiled {}x {} MB {:.2}s", reps, bytes >> 20, te)];
-    // (label, threads, env settings)
-    let variants: Vec<(&str, usize, Vec<(&str, &str)>)> = vec![
-        ("base", nt, vec![]),
-        ("base2", nt, vec![]),
-        ("b9", nt, vec![("FM_B1", "9"), ("FM_B2", "9")]),
-        ("b11", nt, vec![("FM_B1", "11"), ("FM_B2", "11")]),
-        ("b12", nt, vec![("FM_B1", "12"), ("FM_B2", "12")]),
-        ("b11/10", nt, vec![("FM_B1", "11"), ("FM_B2", "10")]),
-        ("ch1M", nt, vec![("FM_CHUNK", "1048576")]),
-        ("ch16M", nt, vec![("FM_CHUNK", "16777216")]),
-        ("t16", 2 * nt, vec![]),
-        ("norel", nt, vec![("FM_NORELEASE", "1")]),
-        ("base3", nt, vec![]),
-    ];
+fn lap_line() -> String {
     let short = |l: &str| match l {
         "opened" => "o",
         "links" => "l",
+        "prepopulated" => "pp",
         "stage1 parse" => "p",
         "stage2 dedup" => "d",
         "stage3 sessions + user_daily" => "s",
         "written" => "w",
         _ => "?",
     };
-    let run_one = |label: &str, n: usize, env: &[(&str, &str)], profile: bool| -> String {
-        for (k, v) in env {
-            std::env::set_var(k, v);
-        }
-        LAPS.lock().unwrap().clear();
-        let out = scratch.join(format!("out-{}", label.replace('/', "_")));
-        if profile {
-            prof_start(500);
-        }
-        let (_, e, u, s) = timed(|| run(&tiled, &out, n));
-        if profile {
-            prof_stop();
-        }
-        for (k, _) in env {
-            std::env::remove_var(k);
-        }
-        let _ = std::fs::remove_dir_all(&out);
-        let mut prev = 0.0;
-        let mut parts = Vec::new();
-        for (name, t) in LAPS.lock().unwrap().iter() {
-            parts.push(format!("{}{:.3}", short(name), t - prev));
-            prev = *t;
-        }
-        format!("V {:6} {} T{:.3} u{:.2} s{:.2}", label, parts.join(" "), e, u, s)
-    };
-    for (label, n, env) in &variants {
-        lines.push(run_one(label, *n, env, false));
+    let mut prev = 0.0;
+    let mut parts = Vec::new();
+    for (name, t) in LAPS.lock().unwrap().iter() {
+        parts.push(format!("{}{:.3}", short(name), t - prev));
+        prev = *t;
     }
-    // a profiled run of the default settings
-    lines.push(run_one("prof", nt, &[], true));
-    lines.extend(prof_report(16, 8));
+    parts.join(" ")
+}
+
+/// Run the pipeline in a forked child that exits like a real run, so the wall
+/// time includes process teardown. Returns "laps W<wall> u<user> s<sys>".
+fn run_child(data: &Path, out: &Path, n: usize, env: &[(&str, &str)], run: &dyn Fn(&Path, &Path, usize)) -> String {
+    for (k, v) in env {
+        std::env::set_var(k, v);
+    }
+    let mut fds = [0i32; 2];
+    unsafe { libc::pipe(fds.as_mut_ptr()) };
+    let t = Instant::now();
+    let pid = unsafe { libc::fork() };
+    if pid == 0 {
+        unsafe { libc::close(fds[0]) };
+        LAPS.lock().unwrap().clear();
+        run(data, out, n);
+        let line = lap_line();
+        unsafe { libc::write(fds[1], line.as_ptr() as *const libc::c_void, line.len()) };
+        std::process::exit(0);
+    }
+    unsafe { libc::close(fds[1]) };
+    let mut buf = vec![0u8; 4096];
+    let mut got = 0;
+    loop {
+        let k = unsafe { libc::read(fds[0], buf[got..].as_mut_ptr() as *mut libc::c_void, buf.len() - got) };
+        if k <= 0 {
+            break;
+        }
+        got += k as usize;
+    }
+    unsafe { libc::close(fds[0]) };
+    let mut status = 0;
+    let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
+    unsafe { libc::wait4(pid, &mut status, 0, &mut ru) };
+    let wall = t.elapsed().as_secs_f64();
+    for (k, _) in env {
+        std::env::remove_var(k);
+    }
+    let _ = std::fs::remove_dir_all(out);
+    let tv = |v: libc::timeval| v.tv_sec as f64 + v.tv_usec as f64 * 1e-6;
+    format!("{} W{:.3} u{:.2} s{:.2}{}", String::from_utf8_lossy(&buf[..got]), wall, tv(ru.ru_utime), tv(ru.ru_stime), if status != 0 { " FAIL" } else { "" })
+}
+
+pub fn main(data_dir: &Path, nt: usize, run: &dyn Fn(&Path, &Path, usize)) {
+    let t0 = Instant::now();
+    let scratch = std::path::PathBuf::from(std::env::var("SCRATCH_DIR").unwrap_or("/scratch".into()));
+    let r20: usize = std::env::var("FM_DIAG_REPS").ok().and_then(|v| v.parse().ok()).unwrap_or(20);
+    let r60: usize = std::env::var("FM_DIAG_REPS60").ok().and_then(|v| v.parse().ok()).unwrap_or(60);
+    QUIET.store(true, Relaxed);
+    let mut lines = Vec::new();
+    let t20 = scratch.join("tiled20");
+    let (b, te, _, _) = timed(|| tile(data_dir, &t20, r20, nt));
+    lines.push(format!("T {}x {} MB {:.2}s", r20, b >> 20, te));
+    let out = scratch.join("out");
+    let variants: Vec<(&str, Vec<(&str, &str)>)> = vec![
+        ("b10", vec![("FM_B1", "10"), ("FM_B2", "10")]),
+        ("b9", vec![]),
+        ("b8", vec![("FM_B1", "8"), ("FM_B2", "8")]),
+        ("b7", vec![("FM_B1", "7"), ("FM_B2", "7")]),
+        ("b8/9", vec![("FM_B1", "8"), ("FM_B2", "9")]),
+        ("norel", vec![("FM_NORELEASE", "1")]),
+        ("norelin", vec![("FM_NORELIN", "1")]),
+        ("norelar", vec![("FM_NORELAR", "1")]),
+        ("pop", vec![("FM_POP", "1")]),
+        ("pophuge", vec![("FM_POP", "huge")]),
+        ("b9again", vec![]),
+    ];
+    for (label, env) in &variants {
+        lines.push(format!("V {:7} {}", label, run_child(&t20, &out, nt, env, run)));
+    }
+    // the final's scale
+    let t60 = scratch.join("tiled60");
+    let _ = std::fs::remove_dir_all(&t20);
+    let (b, te, _, _) = timed(|| tile(data_dir, &t60, r60, nt));
+    lines.push(format!("T {}x {} MB {:.2}s", r60, b >> 20, te));
+    for (label, env) in [("60:auto", vec![]), ("60:b10", vec![("FM_B1", "10"), ("FM_B2", "10")]), ("60:b9", vec![("FM_B1", "9"), ("FM_B2", "9")]), ("60:pop", vec![("FM_POP", "1")])] {
+        lines.push(format!("V {:7} {}", label, run_child(&t60, &out, nt, &env, run)));
+    }
+    let _ = std::fs::remove_dir_all(&t60);
     lines.push(facts());
     lines.push(format!("Z done {:.1}s; exit 1 on purpose", t0.elapsed().as_secs_f64()));
     for l in &lines {

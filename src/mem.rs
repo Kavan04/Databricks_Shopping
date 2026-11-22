@@ -65,6 +65,44 @@ impl Arena {
 }
 
 impl Arena {
+    /// Map and fault in the first `bytes` of the arena up front, from `nt`
+    /// threads at once (MADV_POPULATE_WRITE), optionally as huge pages. Blocks
+    /// are later handed out from this already-present memory, so stage 1 does
+    /// not take a page fault per 4 KiB of output.
+    pub fn prepopulate(&self, bytes: usize, nt: usize, huge: bool) {
+        let nseg = bytes.div_ceil(SEG_BYTES).min(MAX_SEGS);
+        let mut ranges = Vec::new();
+        for sg in 0..nseg {
+            let mut p = self.segs[sg].load(Acquire);
+            if p.is_null() {
+                p = map_anon(SEG_BYTES);
+                self.segs[sg].store(p, Release);
+            }
+            if huge {
+                unsafe { libc::madvise(p as *mut libc::c_void, SEG_BYTES, libc::MADV_HUGEPAGE) };
+            }
+            let len = bytes.saturating_sub(sg * SEG_BYTES).min(SEG_BYTES);
+            const PIECE: usize = 32 << 20;
+            let mut o = 0;
+            while o < len {
+                ranges.push((p as usize + o, PIECE.min(len - o)));
+                o += PIECE;
+            }
+        }
+        let next = AtomicUsize::new(0);
+        std::thread::scope(|s| {
+            for _ in 0..nt.min(ranges.len()).max(1) {
+                s.spawn(|| loop {
+                    let i = next.fetch_add(1, Relaxed);
+                    let Some(&(p, len)) = ranges.get(i) else { break };
+                    unsafe {
+                        libc::madvise(p as *mut libc::c_void, len, 23 /* MADV_POPULATE_WRITE */);
+                    }
+                });
+            }
+        });
+    }
+
     /// Give all arena memory back to the kernel from `nt` threads at once. The
     /// kernel would otherwise free it single-threaded at exit. Nothing may read
     /// arena records afterwards.

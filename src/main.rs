@@ -186,7 +186,7 @@ static LAHEAD: AtomicUsize = AtomicUsize::new(32);
 
 fn stage1(ctx: &Ctx, arena: &Arena, files: &[InFile], tasks: &[RTask], nt: usize, lt: &LinkTable) -> Vec<S1> {
     let next = AtomicUsize::new(0);
-    let keep_maps = std::env::var_os("FM_NORELEASE").is_some();
+    let keep_maps = std::env::var_os("FM_NORELEASE").is_some() || std::env::var_os("FM_NORELIN").is_some();
     let (nb1, nb2) = (1usize << ctx.b1bits, 1usize << ctx.b2bits);
     thread::scope(|s| {
         let hs: Vec<_> = (0..nt)
@@ -846,8 +846,9 @@ fn run(data_dir: &Path, out_dir: &Path, nt: usize, chunk: usize) {
     add_files(&data_dir.join("links"), 2, chunk.min(1 << 20), &mut files, &mut lk_tasks);
     let est_rows = ev_bytes / 64 + 1;
     let env_bits = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<u32>().ok());
-    let b1bits = env_bits("FM_B1").unwrap_or(log2_ceil(est_rows / 32768).clamp(6, 11));
-    let b2bits = env_bits("FM_B2").unwrap_or(log2_ceil(est_rows / 32768).clamp(6, 11));
+    // 512 buckets at 20M events: on the scorer 512 beat 1024, 2048 and 4096
+    let b1bits = env_bits("FM_B1").unwrap_or(log2_ceil(est_rows / 65536).clamp(6, 11));
+    let b2bits = env_bits("FM_B2").unwrap_or(log2_ceil(est_rows / 65536).clamp(6, 11));
     for t in tasks.iter().take(2 * nt) {
         prefetch_range(&files[t.file], t.off, t.len);
     }
@@ -863,6 +864,13 @@ fn run(data_dir: &Path, out_dir: &Path, nt: usize, chunk: usize) {
         return;
     }
     let arena = Arena::new();
+    if let Ok(mode) = std::env::var("FM_POP") {
+        // records: events 32 B each, clicks 24 B each, plus one partly filled block per bucket and worker
+        let ck_bytes: usize = files.iter().zip(0..).filter(|(_, i)| tasks.iter().any(|t| t.file == *i && t.kind == 1)).map(|(f, _)| f.size).sum();
+        let need = est_rows * 32 + ck_bytes / 45 * 24 + ((1usize << b1bits) + (1usize << b2bits)) * nt * BLK;
+        arena.prepopulate(need + need / 16, nt, mode == "huge");
+        lap("prepopulated");
+    }
     let s1 = stage1(&ctx, &arena, &files, &tasks, nt, &lt);
     lap("stage1 parse");
 
@@ -883,7 +891,7 @@ fn run(data_dir: &Path, out_dir: &Path, nt: usize, chunk: usize) {
     let cat_refs: Vec<&[u8]> = cats.iter().map(|c| &c[..]).collect();
     let w3 = stage3(&ctx, &names, &s1, &s2, nt, &cat_refs, &out_dir);
     lap("stage3 sessions + user_daily");
-    if std::env::var_os("FM_NORELEASE").is_none() {
+    if std::env::var_os("FM_NORELEASE").is_none() && std::env::var_os("FM_NORELAR").is_none() {
         arena.release(nt);
     }
 
