@@ -109,11 +109,13 @@ fn fields<'a, const N: usize>(d: &'a [u8], s0: usize, e0: usize, commas: &[u32; 
     for k in 0..N {
         let e = if k < N - 1 { commas[k] as usize } else { e0 };
         let len = e - s;
+        // no branches on the field length (empty and 1-byte fields are common,
+        // e.g. the price of a view): an empty field's first byte is the
+        // separator after it, never a quote, and `last` falls back to `first`
         let first = unsafe { *p.add(s) };
-        let li = if len >= 2 { e - 1 } else { s };
-        let last = unsafe { *p.add(li) };
-        let qs = len >= 1 && first == b'"';
-        let qe = len >= 2 && last == b'"';
+        let last = unsafe { *p.add(e.max(s + 1) - 1) };
+        let qs = first == b'"';
+        let qe = (len >= 2) & (last == b'"');
         bad |= qs & !qe;
         q2 += 2 * qs as u32;
         let q = (qs & qe) as usize;
