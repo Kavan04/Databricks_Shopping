@@ -26,7 +26,7 @@ pub struct LinkTable {
 impl LinkTable {
     #[inline(always)]
     pub fn resolve(&self, k: u64) -> u64 {
-        self.map.get(k).unwrap_or(k)
+        self.map.resolve(k)
     }
 }
 

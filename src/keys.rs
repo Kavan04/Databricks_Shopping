@@ -243,6 +243,25 @@ impl PartMap {
             i = (i + 1) & mask;
         }
     }
+    /// The value for `k`, or `k` itself when it has none. Whether a key is in
+    /// the map is random per lookup (about a third of the events' users are
+    /// linked), so a branch on the filter mispredicted often; instead a
+    /// filtered-out key reads an empty dummy slot and the result is selected
+    /// arithmetically. Only a first slot holding another key branches (rare).
+    #[inline(always)]
+    pub fn resolve(&self, k: u64) -> u64 {
+        let h = mix(k);
+        let part = unsafe { self.parts.get_unchecked((h >> (64 - PB)) as usize) };
+        let m = (part.maybe(h) as usize).wrapping_neg();
+        let sp = unsafe { part.slots.as_ptr().add(part.slot(h)) } as usize;
+        let p = ((sp & m) | (&NO_SLOT as *const [u64; 2] as usize & !m)) as *const [u64; 2];
+        let s = unsafe { *p };
+        if s[0] != k && s[0] != 0 {
+            return self.get(k).unwrap_or(k);
+        }
+        let f = ((s[0] == k) as u64).wrapping_neg();
+        (s[1] & f) | (k & !f)
+    }
     /// First half of a two-stage prefetch: bring in the filter word for `k`.
     /// (The filter is larger than the scorer's 1 MB L2, so checking it cold
     /// stalls; issue this well ahead of `prefetch`.)
@@ -252,16 +271,20 @@ impl PartMap {
         let part = unsafe { self.parts.get_unchecked((h >> (64 - PB)) as usize) };
         prefetch(unsafe { part.bloom.as_ptr().add(bloom_word(h, part.wmask)) });
     }
-    /// Prefetch the table slot of `k`, unless the filter already rules it out.
+    /// Prefetch the table slot of `k`, unless the filter already rules it out
+    /// (then the dummy slot, already in cache; no branch either way).
     #[inline(always)]
     pub fn prefetch(&self, k: u64) {
         let h = mix(k);
         let part = unsafe { self.parts.get_unchecked((h >> (64 - PB)) as usize) };
-        if part.maybe(h) {
-            prefetch(unsafe { part.slots.as_ptr().add(part.slot(h)) });
-        }
+        let m = (part.maybe(h) as usize).wrapping_neg();
+        let sp = unsafe { part.slots.as_ptr().add(part.slot(h)) } as usize;
+        prefetch(((sp & m) | (&NO_SLOT as *const [u64; 2] as usize & !m)) as *const [u64; 2]);
     }
 }
+
+/// A slot no key matches (keys are never 0), read by filtered-out lookups.
+static NO_SLOT: [u64; 2] = [0, 0];
 
 // ---------------------------------------------------------------- timestamps
 
@@ -658,6 +681,29 @@ mod tests {
         for s in ["2028-02-29T00:00:00Z", "2027-02-29T00:00:00Z", "2026-10-03T19:58:10-04:00", "0001791071890000", "86400000", "1791071890000.0", "-5", "1.79e12", "2026-10-03T24:00:00Z", "2026-10-03T23:59:60Z", "2026-10-04T01:30:00+24:00", "2026-10-04T01:30:00+05:60", "2026-10-04T01:30:00-00:00"] {
             let buf = padded(s.as_bytes(), b'9');
             assert_eq!(ts_p(&buf[..s.len()], &mut dc), parse_ts(s.as_bytes()), "{}", s);
+        }
+    }
+
+    /// The branch-free lookup agrees with the plain one on present and absent
+    /// keys, with tables dense enough that first slots often collide.
+    #[test]
+    fn partmap_resolve_matches_get() {
+        let mut r = Rng(5);
+        for n in [10usize, 1000, 100_000] {
+            let mut parts: Vec<Part> = (0..NPART).map(|_| Part::with_capacity(n / NPART + 1)).collect();
+            let keys: Vec<u64> = (0..n).map(|_| r.next() | 1).collect();
+            for (i, &k) in keys.iter().enumerate() {
+                parts[(mix(k) >> (64 - PB)) as usize].insert(k, i as u64 + 7);
+            }
+            let m = PartMap { parts };
+            for (i, &k) in keys.iter().enumerate() {
+                assert_eq!(m.resolve(k), i as u64 + 7);
+                assert_eq!(m.get(k), Some(i as u64 + 7));
+            }
+            for _ in 0..n * 4 {
+                let k = r.next() | 1;
+                assert_eq!(m.resolve(k), m.get(k).unwrap_or(k));
+            }
         }
     }
 

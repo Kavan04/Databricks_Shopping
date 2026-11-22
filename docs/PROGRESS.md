@@ -23,7 +23,8 @@ Goal: the top of the Shopping Sessions leaderboard. At the time of the first sub
 | v3.11 | `74531b3` | not submitted | dedup buckets over 12K records split into L2-sized pieces first; purchase side records carry their ingest so the price always comes from the winning copy | full suite, both platforms, plus forced splitting (dev with `FM_SUBMAX=100`, fixtures with `FM_SUBMAX=1`) |
 | v3.12 | `f773190` | not submitted | sessions stage: person buckets over 64K events (the 60M scale) are first split into pieces of whole persons, so grouping runs in L2; 20M runs are unchanged | full suite, both platforms, plus forced splitting (dev with `FM_S3MAX=100`, fixtures with `FM_S3MAX=1`, 20M with `FM_S3MAX=20000` identical to v1) |
 | v3.13 | `0428491` | not submitted | event and click parsers compiled into the scanner loop (no call per line); `ingest_ts` fast path (always valid F1 by the rules); single-thread stage 1 about 12% faster locally | full suite, both platforms; new unit test for the ingest parser |
-| v3.14 | see git log | not submitted yet | field splitting without branches on field length (x86 had a compare and jump per field for length <= 1; an empty price is common and unpredictable) | full suite, both platforms |
+| v3.14 | `33a4b24` | not submitted | field splitting without branches on field length (x86 had a compare and jump per field for length <= 1; an empty price is common and unpredictable) | full suite, both platforms |
+| v3.15 | see git log | not submitted yet | branch-free linked-ID lookup and prefetch, branch-free dedup winner collection: single-thread dedup 0.81-0.95 s -> 0.60-0.69 s locally; clicks use the same lookup | full suite, both platforms; new unit test for the lookup |
 
 Local timings come from a Docker VM on an 8-core Apple-silicon Mac, with the data in `/dev/shm`. The Mac is often loaded, so one run can vary 2 to 3x. Only best-of-N is meaningful, and only the board counts.
 
@@ -125,6 +126,18 @@ Each variant runs in its own child process, so W includes exit and teardown (20x
 | 2048 + pre-fault | 3.518 |
 
 Process exit after the last lap is now about 10 ms. At 20M the stages take: parse 0.52 s, dedup 0.21 s, sessions 0.21 s, links 0.06 s, startup 0.025 s, release and campaign table 0.03 s.
+
+## v3.15: branches that could not be predicted
+
+A line-level profile of dedup put about 25% of its samples on the first instruction after the link filter check, in both the prefetch and the lookup. That check is random per event: about a third of the users in events are linked IDs. The branch on it mispredicted, twice per event.
+
+Now a key the filter rules out reads a static empty slot instead. The slot pointer is chosen with a mask, the lookup result is chosen arithmetically, and the prefetch of a filtered-out key goes to the dummy slot, which is already in cache. Only a first slot holding a different key still branches (a probe collision, about 8% of lookups).
+
+Collecting dedup winners had the same problem: about a third of table slots are empty, in random order. Every slot is now written, and the output length advances by the slot's valid bit.
+
+| Single thread, 20M, six runs (s) | v3.14 | v3.15 |
+| --- | --- | --- |
+| Dedup stage, sorted | 0.81 0.82 0.86 0.90 0.91 0.95 | 0.60 0.61 0.62 0.62 0.64 0.69 |
 
 ## v3.13: no function call per line
 

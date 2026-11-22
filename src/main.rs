@@ -398,18 +398,24 @@ impl PcTable {
     }
 }
 
-/// The valid winners of a dedup table, as (user key, w2).
+/// The valid winners of a dedup table, as (user key, w2). About a third of the
+/// slots are empty, in random order, so every slot is written and the length
+/// advances by its valid bit instead of branching on it. Only valid purchases
+/// carry PFLAG (empty slots and invalid copies have user 0).
 #[inline(always)]
 fn survivors(table: &[E1], pt: &PcTable, surv: &mut Vec<(u64, u64)>) {
+    surv.reserve(table.len());
+    let mut n = surv.len();
+    let sp = surv.as_mut_ptr();
     for t in table {
-        if t.w & 1 == 1 {
-            let mut w2 = (t.w >> 33) << 33;
-            if t.user & PFLAG != 0 {
-                w2 |= pt.get(t.eid);
-            }
-            surv.push((t.user & !PFLAG, w2));
+        let mut w2 = (t.w >> 33) << 33;
+        if t.user & PFLAG != 0 {
+            w2 |= pt.get(t.eid);
         }
+        unsafe { sp.add(n).write((t.user & !PFLAG, w2)) };
+        n += (t.w & 1) as usize;
     }
+    unsafe { surv.set_len(n) };
 }
 
 fn stage2(ctx: &Ctx, s1: &[S1], lt: &LinkTable, arena: &Arena, nt: usize) -> Vec<Vec<Vec<Seg<Ev>>>> {
