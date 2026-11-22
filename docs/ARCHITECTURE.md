@@ -1,4 +1,4 @@
-# Architecture (v3)
+# Architecture (v3.11)
 
 How `src/` turns the CSV logs in `/data` into the two Parquet tables. The spec is `rules.md`; this page explains the data flow and the reasons for each design choice. Scores, measurements and experiments are tracked in [PROGRESS.md](PROGRESS.md).
 
@@ -26,11 +26,11 @@ flowchart LR
 
     L -->|"A: parallel parse,<br/>node index, union-find"| LT[("LinkTable<br/>64-way PartMap<br/>id key -> person key")]
 
-    E -->|"B: 4 MB ranges, SIMD scan,<br/>parse + validate"| EB["E1 buckets by event_id<br/>32 B / event"]
+    E -->|"B: 4 MB ranges, SIMD scan,<br/>parse + validate"| EB["E1 buckets by event_id<br/>24 B / event<br/>(+ 24 B price record per purchase)"]
     C -->|"B: parse + validate,<br/>prefetched person lookup"| CB["Ck buckets by person<br/>24 B / click"]
     LT -.-> CB
 
-    EB -->|"C: dedup per bucket<br/>(min ingest_ts wins)"| EV["Ev buckets by person<br/>16 B / event<br/>(in recycled blocks)"]
+    EB -->|"C: split into L2-sized pieces,<br/>dedup per piece<br/>(min ingest_ts wins)"| EV["Ev buckets by person<br/>16 B / event<br/>(in recycled blocks)"]
     LT -.->|"prefetched lookups"| EV
 
     EV --> S3["D: per person bucket:<br/>radix groups, tiny sorts,<br/>sessionize, credit + assists"]
@@ -41,11 +41,11 @@ flowchart LR
     S3 --> CD[/"campaign_daily/part-0.parquet"/]
 ```
 
-Stages run one after another. Each stage is a `std::thread::scope` with `NCPU` workers pulling work items from an atomic counter:
+Stages run one after another, except links, which overlap stage B: clicks need links, so click ranges come last and wait for them. Each stage is a `std::thread::scope` with `NCPU` workers pulling work items from an atomic counter:
 
 | Stage | Work items |
 | --- | --- |
-| A (links) | link file ranges, then partitions |
+| A (links) | link file ranges, then partitions; runs on 3 threads of its own while stage B parses events |
 | B (parse) | 4 MB input ranges |
 | C (dedup) | event_id buckets |
 | D (sessions) | person buckets, biggest first so a whale person's bucket does not finish last |
@@ -59,8 +59,8 @@ flowchart LR
     R["reserve file size + pad<br/>(anonymous, zero)"] --> M["mmap the file over its front<br/>(MAP_FIXED)"]
     M --> T["4 MB byte ranges"]
     T --> W["worker: lines that START in its range<br/>(skip the partial first line or header,<br/>finish the last line past the end)"]
-    W --> PO["madvise(POPULATE_READ) on the range:<br/>one call maps all its pages"]
     T -.->|"ranges 2*NCPU ahead"| WN["madvise(WILLNEED)"]
+    W --> RL["after parsing: madvise(DONTNEED)<br/>so exit has less to unmap"]
 ```
 
 Ranges are byte offsets, not line-aligned, so nothing scans the file before work starts. The boundary rule was verified against the dev answer with 997-byte and 64-byte ranges.
@@ -139,30 +139,39 @@ Record layouts:
 
 | Record | Bytes | Fields |
 | --- | --- | --- |
-| `E1` (event before dedup) | 32 | `eid`, `user`, `w2 = ts_rel<<33 \| price<<9 \| category`, `ing = ingest<<1 \| ok` |
-| `Ev` (surviving event) | 16 | `person`, `w2` |
+| `E1` (event before dedup) | 24 | `eid`, `user` (bit 55 flags a valid purchase), `w = ts_rel<<33 \| ingest_s<<1 \| ok` |
+| `Pc` (valid purchase) | 24 | `eid`, `pc = price<<9 \| category`, `ing` (its copy's ingest) |
+| `Ev` (surviving event) | 16 | `person`, `w2 = ts_rel<<33 \| price<<9 \| category` |
 | `Ck` (valid click) | 24 | `person`, `w1 = ts_rel<<24 \| campaign`, `ckey` |
+
+Bit 55 of a key is always 0: packed keys are ASCII bytes, and hashed keys clear it. `ingest_s` is whole seconds (F1 has no fractions) offset into 32 bits. Purchases are about 3% of events, so price and category travel in a side record keyed by event id instead of widening every event.
 
 `ts_rel` is measured from `window_start - 7 days`, so events and clicks share one 31-bit clock.
 
 Clicks are parsed into a small per-range buffer first. Their person lookups then run with prefetches issued 16 clicks ahead.
 
-Records go into 1024 event_id buckets through **write-combining** buffers (`mem::WcBuckets`). Each bucket fills one 64-byte line in a small hot buffer (2 events of 32 B, or 4 stage-2 outputs of 16 B), and full lines go to the bucket's block with non-temporal stores. Scattering straight into a thousand buckets missed the cache on nearly every store; the push cost per line roughly tracks the number of buckets (5.5 ns at 64, about 15 ns at 1024, 20 to 29 ns at 4096).
+Records go into 512 event_id buckets through **write-combining** buffers (`mem::WcBuckets`). Each bucket fills a group of whole cache lines in a small hot buffer (8 events of 24 B = 192 B, or 4 stage-2 outputs of 16 B = 64 B), and full groups go to the bucket's block with non-temporal stores. Scattering straight into a thousand buckets missed the cache on nearly every store; the push cost per line roughly tracks the number of buckets (5.5 ns at 64, about 15 ns at 1024, 20 to 29 ns at 4096).
 
 ## 7. Stage C: dedup
 
 ```mermaid
 flowchart LR
-    B["one event_id bucket<br/>(segments from all workers)"] --> T["open-addressing table of E1<br/>(load <= 0.75)"]
-    T -->|"same eid: keep smaller ingest"| T
-    T --> R["input blocks recycled<br/>for this worker's output"]
-    T --> S{"kept copy ok?"}
+    B["one event_id bucket<br/>(segments from all workers)"] --> Q{"more than 12K records?"}
+    Q -->|no| T["one open-addressing table<br/>(load <= 0.75)"]
+    Q -->|yes| SP["scatter by the next hash bits<br/>into pieces of ~8K records<br/>(reused per-worker buffer)"]
+    SP --> TP["one table per piece<br/>(at most 16K slots = 384 KB, stays in L2)"]
+    T -->|"same eid: keep smaller ingest"| S{"kept copy ok?"}
+    TP -->|"same eid: keep smaller ingest"| S
+    B --> R["input blocks recycled<br/>for this worker's output"]
     S -->|no| D[dropped]
-    S -->|yes| P["resolve person<br/>(PartMap, prefetched 16 ahead)"]
+    S -->|yes| PC["purchase? price + category from<br/>the earliest Pc copy of that eid"]
+    PC --> P["resolve person<br/>(Bloom + PartMap, prefetched 32 and 64 ahead)"]
     P --> O["Ev into person bucket"]
 ```
 
 Dedup happens before validation, as the rules require: an invalid earliest copy still wins its eid and then drops the event.
+
+At 60M events a 512-way bucket holds about 125K records. One table for all of them would be 6 MB per worker, so nearly every insert would miss both L2 (1 MB per core on the scorer) and the shared L3. Splitting first costs one sequential pass and keeps every insert in L2.
 
 ## 8. Stage D: sessions, credit and assists
 
@@ -184,7 +193,7 @@ flowchart TD
 
 ## 9. Output
 
-* `user_daily` is written as one file per worker, in parallel. Names are decoded into one buffer per file, and each value is a slice of it, with no per-row allocation.
+* `user_daily` is written as one file per worker, in parallel, as each worker finishes its buckets. Pages of up to 128K rows are encoded into one reused buffer and streamed through a 1 MB writer, so no file is assembled whole in memory.
 * `campaign_daily` is one file.
 * Encoding is plain and uncompressed with no statistics. `day` is `INT32 (DATE)`.
 
@@ -196,5 +205,6 @@ flowchart TD
 | 36 edge-case fixtures | `python3 scripts/run_fixtures.py fixtures -- scripts/dev_run.sh` |
 | 1M dev set vs published answer | `scripts/dev_run.sh dev out && python3 scripts/compare.py out dev-answer` |
 | Range-boundary stress | the dev set with `FM_CHUNK=997` and `FM_CHUNK=64` |
+| Dedup split path | the dev set with `FM_SUBMAX=100` (every bucket split into dozens of pieces) and the fixtures with `FM_SUBMAX=1` |
 | Scorer platform | all of the above with `IMAGE=...:amd64 PLATFORM=linux/amd64` |
 | Regression on 20M | output must equal the previous version's, row for row |
