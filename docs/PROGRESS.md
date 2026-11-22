@@ -19,7 +19,8 @@ Goal: the top of the Shopping Sessions leaderboard. At the time of the first sub
 | v3.7 | `2ea5cf5` | not submitted | two-stage prefetch for person lookups: the filter word is fetched before it is checked, so the prefetch pass no longer stalls on it | full suite, both platforms; 20M identical to v1 |
 | v3.8 | `2fe4a4a` | not submitted | link joining overlapped with event parsing; 512 buckets at every scale; startup without per-line allocations; unused event blocks released at the end of stage 2 | full suite, both platforms; 20M identical to v1 |
 | v3.9 | `fb3b6c7` | not submitted | 24-byte event records: push 2.5 to 5 ns per line instead of 10 to 14; single-thread total 3.46 s vs 3.53 s | full suite, both platforms; 20M identical to v1 |
-| v3.10 | see git log | not submitted yet | Parquet streamed to disk page by page (about 90 MB less fresh memory); diagnostics switches for plain vs streaming stores and dedup-table prefetch | full suite, both platforms; 20M identical to v1 in polars, pyarrow and DuckDB |
+| v3.10 | `95fc882` | not submitted | Parquet streamed to disk page by page (about 90 MB less fresh memory); diagnostics switches for plain vs streaming stores and dedup-table prefetch | full suite, both platforms; 20M identical to v1 in polars, pyarrow and DuckDB |
+| v3.11 | see git log | not submitted yet | dedup buckets over 12K records split into L2-sized pieces first; purchase side records carry their ingest so the price always comes from the winning copy | full suite, both platforms, plus forced splitting (dev with `FM_SUBMAX=100`, fixtures with `FM_SUBMAX=1`) |
 
 Local timings come from a Docker VM on an 8-core Apple-silicon Mac, with the data in `/dev/shm`. The Mac is often loaded, so one run can vary 2 to 3x. Only best-of-N is meaningful, and only the board counts.
 
@@ -121,6 +122,14 @@ Each variant runs in its own child process, so W includes exit and teardown (20x
 | 2048 + pre-fault | 3.518 |
 
 Process exit after the last lap is now about 10 ms. At 20M the stages take: parse 0.52 s, dedup 0.21 s, sessions 0.21 s, links 0.06 s, startup 0.025 s, release and campaign table 0.03 s.
+
+## v3.11: dedup tables that fit in L2
+
+The scorer's 60M run spent 0.91 s in dedup against 0.21 s at 20M, more than 4x for 3x the data. With 512 buckets, each 60M bucket holds about 125K records. Its table was 256K slots, 6 to 8 MB per worker, so nearly every insert missed L2 and L3 (1 MB L2 per core, 33 MB L3 shared by 8 workers). 1024 buckets did not help (0.90 s): 4 MB tables still miss.
+
+A bucket over 12K records is now first scattered by the next hash bits into pieces of about 8K, each with its own table of at most 16K slots (384 KB). The extra pass reads the bucket sequentially and writes it once into a reused per-worker buffer. Every insert then hits L2. At 20M (about 42K records per bucket), each bucket becomes 8 tables of 192 KB instead of one of 1.5 MB.
+
+The purchase side record now also holds its copy's ingest. Its table keeps each event's earliest copy, which is the dedup winner whenever the winner is a valid purchase (copies with equal ingest are identical). Before, a later copy could overwrite the price if two valid copies differed.
 
 ## v3.9: 24-byte event records
 

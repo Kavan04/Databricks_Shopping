@@ -558,9 +558,9 @@ pub fn main(data_dir: &Path, nt: usize, run: &dyn Fn(&Path, &Path, usize)) {
     let variants: Vec<(&str, Vec<(&str, &str)>)> = vec![
         ("base", vec![]),
         ("plainst", vec![("FM_PLAINST", "1")]),
-        ("tah4", vec![("FM_TAHEAD", "4")]),
-        ("tah8", vec![("FM_TAHEAD", "8")]),
-        ("tah16", vec![("FM_TAHEAD", "16")]),
+        ("nosub", vec![("FM_SUBMAX", "100000000")]),
+        ("sub6k", vec![("FM_SUBMAX", "6144")]),
+        ("sub24k", vec![("FM_SUBMAX", "24576")]),
         ("lnk2", vec![("FM_LINK_THREADS", "2")]),
         ("lnk5", vec![("FM_LINK_THREADS", "5")]),
         ("b9/10", vec![("FM_B2", "10")]),
@@ -575,7 +575,7 @@ pub fn main(data_dir: &Path, nt: usize, run: &dyn Fn(&Path, &Path, usize)) {
     let _ = std::fs::remove_dir_all(&t20);
     let (b, te, _, _) = timed(|| tile(data_dir, &t60, r60, nt));
     lines.push(format!("T {}x {} MB {:.2}s", r60, b >> 20, te));
-    for (label, env) in [("60:base", vec![]), ("60:b10/9", vec![("FM_B1", "10")]), ("60:tah8", vec![("FM_TAHEAD", "8")]), ("60:plain", vec![("FM_PLAINST", "1")])] {
+    for (label, env) in [("60:base", vec![]), ("60:b10/9", vec![("FM_B1", "10")]), ("60:nosub", vec![("FM_SUBMAX", "100000000")]), ("60:plain", vec![("FM_PLAINST", "1")])] {
         lines.push(format!("V {:7} {}", label, run_child(&t60, &out, nt, &env, run)));
     }
     let _ = std::fs::remove_dir_all(&t60);

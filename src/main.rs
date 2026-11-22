@@ -57,12 +57,14 @@ struct E1 {
     w: u64,
 }
 
-/// Price and category of a valid purchase: `pc` = price << 9 | category.
+/// Price and category of a valid purchase: `pc` = price << 9 | category,
+/// `ing` = its copy's ingest (as in `E1::w`), so dedup can pick the winner's.
 #[derive(Clone, Copy, Default)]
 #[repr(C)]
 struct Pc {
     eid: u64,
     pc: u64,
+    ing: u64,
 }
 
 /// The ingest part of `E1::w`, the dedup order.
@@ -207,8 +209,6 @@ fn parse_click(ctx: &Ctx, f: &[&[u8]; 4], dc: &mut DateCache, strs: &mut Vec<(u6
 const AHEAD: usize = 16;
 /// Lookahead of stage 2's person lookups.
 static LAHEAD: AtomicUsize = AtomicUsize::new(32);
-/// Lookahead of stage 2's dedup-table inserts (0 = off; a diagnostics switch).
-static TAHEAD: AtomicUsize = AtomicUsize::new(0);
 
 fn stage1(ctx: &Ctx, arena: &Arena, files: &[InFile], tasks: &[RTask], nt: usize, lt_cell: &OnceLock<LinkTable>) -> Vec<S1> {
     let next = AtomicUsize::new(0);
@@ -220,7 +220,7 @@ fn stage1(ctx: &Ctx, arena: &Arena, files: &[InFile], tasks: &[RTask], nt: usize
                 s.spawn(|| {
                     let mut blocks = Blocks::new(arena);
                     let mut ev: WcBuckets<E1, 8> = WcBuckets::new(nb1);
-                    let mut pr: WcBuckets<Pc, 4> = WcBuckets::new(nb1);
+                    let mut pr: WcBuckets<Pc, 8> = WcBuckets::new(nb1);
                     let mut ck: Vec<Bkt<Ck>> = (0..nb2).map(|_| Bkt::new()).collect();
                     let mut strs = Vec::new();
                     let mut dc = DateCache::new();
@@ -241,7 +241,7 @@ fn stage1(ctx: &Ctx, arena: &Arena, files: &[InFile], tasks: &[RTask], nt: usize
                                     let b = bucket(e.eid, ctx.b1bits);
                                     ev.push(b, e, &mut blocks);
                                     if pc != 0 {
-                                        pr.push(b, Pc { eid: e.eid, pc }, &mut blocks);
+                                        pr.push(b, Pc { eid: e.eid, pc, ing: e1_ingest(e.w) }, &mut blocks);
                                     }
                                 }
                             });
@@ -285,10 +285,107 @@ fn stage1(ctx: &Ctx, arena: &Arena, files: &[InFile], tasks: &[RTask], nt: usize
 // ---------------------------------------------------------------- stage 2: dedup
 
 /// Returns, per worker, per person bucket, the segments it wrote.
+/// Dedup tables take at most this many records: 16K slots of 24 bytes (384 KB)
+/// stay in L2. Bigger buckets are first split by more hash bits into pieces
+/// of about 2/3 of this (FM_SUBMAX).
+static SUB_MAX: AtomicUsize = AtomicUsize::new(12 << 10);
+
+/// log2 of the dedup table size for `m` records (load at most 3/4).
+#[inline(always)]
+fn tab_bits(m: usize) -> u32 {
+    (m + m / 3 + 1).next_power_of_two().max(16).trailing_zeros()
+}
+
+/// Insert records into an open-addressing table keyed by event id, keeping the
+/// copy with the smallest ingest. `shift` = hash bits already spent choosing
+/// the bucket (and piece), so slots use the bits after them.
+#[inline(always)]
+fn dedup_into(table: &mut [E1], shift: u32, tbits: u32, recs: &[E1]) {
+    let mask = table.len() - 1;
+    for r in recs {
+        let mut i = ((mix(r.eid) << shift) >> (64 - tbits)) as usize;
+        loop {
+            let t = unsafe { table.get_unchecked_mut(i) };
+            if t.eid == 0 {
+                *t = *r;
+                break;
+            }
+            if t.eid == r.eid {
+                if e1_ingest(r.w) < e1_ingest(t.w) {
+                    *t = *r;
+                }
+                break;
+            }
+            i = (i + 1) & mask;
+        }
+    }
+}
+
+/// Purchases of one bucket by event id: for each, the copy with the smallest
+/// ingest, which is the dedup winner's whenever the winner is a valid purchase
+/// (copies with equal ingest are identical).
+struct PcTable {
+    t: Vec<Pc>,
+    bits: u32,
+    shift: u32,
+}
+
+impl PcTable {
+    fn build(&mut self, s1: &[S1], b: usize) {
+        let np: usize = s1.iter().map(|w| seg_len(&w.pr[b])).sum();
+        let cap = (2 * np + 1).next_power_of_two().max(16);
+        self.bits = cap.trailing_zeros();
+        self.t.clear();
+        self.t.resize(cap, Pc::default());
+        let mask = cap - 1;
+        for w in s1 {
+            for sg in &w.pr[b] {
+                for r in sg.slice() {
+                    let mut i = self.slot(r.eid);
+                    while self.t[i].eid != 0 && self.t[i].eid != r.eid {
+                        i = (i + 1) & mask;
+                    }
+                    if self.t[i].eid == 0 || r.ing < self.t[i].ing {
+                        self.t[i] = *r;
+                    }
+                }
+            }
+        }
+    }
+    #[inline(always)]
+    fn slot(&self, eid: u64) -> usize {
+        ((mix(eid) << self.shift) >> (64 - self.bits)) as usize
+    }
+    #[inline(always)]
+    fn get(&self, eid: u64) -> u64 {
+        let mask = self.t.len() - 1;
+        let mut i = self.slot(eid);
+        while self.t[i].eid != eid && self.t[i].eid != 0 {
+            i = (i + 1) & mask;
+        }
+        self.t[i].pc
+    }
+}
+
+/// The valid winners of a dedup table, as (user key, w2).
+#[inline(always)]
+fn survivors(table: &[E1], pt: &PcTable, surv: &mut Vec<(u64, u64)>) {
+    for t in table {
+        if t.w & 1 == 1 {
+            let mut w2 = (t.w >> 33) << 33;
+            if t.user & PFLAG != 0 {
+                w2 |= pt.get(t.eid);
+            }
+            surv.push((t.user & !PFLAG, w2));
+        }
+    }
+}
+
 fn stage2(ctx: &Ctx, s1: &[S1], lt: &LinkTable, arena: &Arena, nt: usize) -> Vec<Vec<Vec<Seg<Ev>>>> {
     let next = AtomicUsize::new(0);
     let (nb1, nb2) = (1usize << ctx.b1bits, 1usize << ctx.b2bits);
     let b1bits = ctx.b1bits;
+    let sub_max = SUB_MAX.load(Relaxed);
     thread::scope(|s| {
         let hs: Vec<_> = (0..nt)
             .map(|_| {
@@ -296,7 +393,9 @@ fn stage2(ctx: &Ctx, s1: &[S1], lt: &LinkTable, arena: &Arena, nt: usize) -> Vec
                     let mut blocks = Blocks::new(arena);
                     let mut out: WcBuckets<Ev, 4> = WcBuckets::new(nb2);
                     let mut table: Vec<E1> = Vec::new();
-                    let mut ptab: Vec<Pc> = Vec::new();
+                    let mut scratch: Vec<E1> = Vec::new();
+                    let mut fill: Vec<usize> = Vec::new();
+                    let mut pt = PcTable { t: Vec::new(), bits: 4, shift: b1bits };
                     let mut surv: Vec<(u64, u64)> = Vec::new();
                     loop {
                         let b = next.fetch_add(1, Relaxed);
@@ -307,73 +406,69 @@ fn stage2(ctx: &Ctx, s1: &[S1], lt: &LinkTable, arena: &Arena, nt: usize) -> Vec
                         if n == 0 {
                             continue;
                         }
-                        let cap = (n + n / 3 + 1).next_power_of_two().max(16);
-                        let tbits = cap.trailing_zeros();
-                        let mask = cap - 1;
-                        table.clear();
-                        table.resize(cap, E1::default());
-                        let slot = |eid: u64| ((mix(eid) << b1bits) >> (64 - tbits)) as usize;
-                        let tahead = TAHEAD.load(Relaxed);
-                        for w in s1 {
-                            for sg in &w.ev[b] {
-                                let recs = sg.slice();
-                                for (k, r) in recs.iter().enumerate() {
-                                    if tahead > 0 && k + tahead < recs.len() {
-                                        prefetch(unsafe { table.as_ptr().add(slot(recs[k + tahead].eid)) });
-                                    }
-                                    let mut i = slot(r.eid);
-                                    loop {
-                                        let t = unsafe { table.get_unchecked_mut(i) };
-                                        if t.eid == 0 {
-                                            *t = *r;
-                                            break;
-                                        }
-                                        if t.eid == r.eid {
-                                            if e1_ingest(r.w) < e1_ingest(t.w) {
-                                                *t = *r;
-                                            }
-                                            break;
-                                        }
-                                        i = (i + 1) & mask;
-                                    }
-                                }
-                            }
-                        }
-                        // price and category of this bucket's valid purchases, by event id
-                        let np: usize = s1.iter().map(|w| seg_len(&w.pr[b])).sum();
-                        let pcap = (2 * np + 1).next_power_of_two().max(16);
-                        let (pbits, pmask) = (pcap.trailing_zeros(), pcap - 1);
-                        ptab.clear();
-                        ptab.resize(pcap, Pc::default());
-                        let pslot = |eid: u64| ((mix(eid) << b1bits) >> (64 - pbits)) as usize;
-                        for w in s1 {
-                            for sg in &w.pr[b] {
-                                for r in sg.slice() {
-                                    let mut i = pslot(r.eid);
-                                    while ptab[i].eid != 0 && ptab[i].eid != r.eid {
-                                        i = (i + 1) & pmask;
-                                    }
-                                    ptab[i] = *r;
-                                }
-                            }
-                        }
-                        // this bucket's input blocks are dead now: reuse them for output
-                        for w in s1 {
-                            blocks.recycle(&w.ev[b]);
-                            blocks.recycle(&w.pr[b]);
-                        }
+                        pt.build(s1, b);
                         surv.clear();
-                        for t in &table {
-                            if t.w & 1 == 1 {
-                                let mut w2 = (t.w >> 33) << 33;
-                                if t.user & PFLAG != 0 {
-                                    let mut i = pslot(t.eid);
-                                    while ptab[i].eid != t.eid && ptab[i].eid != 0 {
-                                        i = (i + 1) & pmask;
-                                    }
-                                    w2 |= ptab[i].pc;
+                        if n <= sub_max {
+                            let tb = tab_bits(n);
+                            table.clear();
+                            table.resize(1 << tb, E1::default());
+                            for w in s1 {
+                                for sg in &w.ev[b] {
+                                    dedup_into(&mut table, b1bits, tb, sg.slice());
                                 }
-                                surv.push((t.user & !PFLAG, w2));
+                            }
+                            // this bucket's input blocks are dead now: reuse them for output
+                            for w in s1 {
+                                blocks.recycle(&w.ev[b]);
+                                blocks.recycle(&w.pr[b]);
+                            }
+                            survivors(&table, &pt, &mut surv);
+                        } else {
+                            // split into pieces whose tables fit L2: fixed-size regions,
+                            // generous enough that a hash never overflows one in practice
+                            let target = (sub_max * 2 / 3).max(1);
+                            let sbits = n.div_ceil(target).next_power_of_two().trailing_zeros();
+                            let nsub = 1usize << sbits;
+                            let mut region = (n >> sbits) + (n >> (sbits + 2)) + 64;
+                            loop {
+                                if scratch.len() < region * nsub {
+                                    scratch.resize(region * nsub, E1::default());
+                                }
+                                fill.clear();
+                                fill.extend((0..nsub).map(|k| k * region));
+                                let mut ok = true;
+                                'scatter: for w in s1 {
+                                    for sg in &w.ev[b] {
+                                        for r in sg.slice() {
+                                            let k = ((mix(r.eid) << b1bits) >> (64 - sbits)) as usize;
+                                            let p = unsafe { *fill.get_unchecked(k) };
+                                            if p == (k + 1) * region {
+                                                ok = false;
+                                                break 'scatter;
+                                            }
+                                            unsafe {
+                                                *scratch.get_unchecked_mut(p) = *r;
+                                                *fill.get_unchecked_mut(k) = p + 1;
+                                            }
+                                        }
+                                    }
+                                }
+                                if ok {
+                                    break;
+                                }
+                                region *= 2;
+                            }
+                            for w in s1 {
+                                blocks.recycle(&w.ev[b]);
+                                blocks.recycle(&w.pr[b]);
+                            }
+                            for k in 0..nsub {
+                                let recs = &scratch[k * region..fill[k]];
+                                let tb = tab_bits(recs.len());
+                                table.clear();
+                                table.resize(1 << tb, E1::default());
+                                dedup_into(&mut table, b1bits + sbits, tb, recs);
+                                survivors(&table, &pt, &mut surv);
                             }
                         }
                         let ahead = LAHEAD.load(Relaxed);
@@ -856,7 +951,7 @@ fn main() {
 /// The whole pipeline: `data_dir` in, both tables written under `out_dir`.
 fn run(data_dir: &Path, out_dir: &Path, nt: usize, chunk: usize) {
     let t0 = Instant::now();
-    TAHEAD.store(std::env::var("FM_TAHEAD").ok().and_then(|v| v.parse().ok()).unwrap_or(0), Relaxed);
+    SUB_MAX.store(std::env::var("FM_SUBMAX").ok().and_then(|v| v.parse().ok()).unwrap_or(12 << 10), Relaxed);
     mem::PLAIN_STORES.store(std::env::var_os("FM_PLAINST").is_some(), Relaxed);
     let lap = |what: &str| {
         if diag::QUIET.load(Relaxed) {
