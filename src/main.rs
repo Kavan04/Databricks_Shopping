@@ -768,7 +768,10 @@ fn main() {
     }
     if std::env::var_os("FM_DIAG").is_some() {
         // diagnostics for the scoring machine; never a real run
-        diag::main(&data_dir, nt, &|d: &Path, o: &Path, n: usize| run(d, o, n, CHUNK));
+        diag::main(&data_dir, nt, &|d: &Path, o: &Path, n: usize| {
+            let c = std::env::var("FM_CHUNK").ok().and_then(|v| v.parse().ok()).unwrap_or(CHUNK);
+            run(d, o, n, c)
+        });
         std::process::exit(1);
     }
     run(&data_dir, &out_dir, nt, chunk);
@@ -780,6 +783,10 @@ fn main() {
 fn run(data_dir: &Path, out_dir: &Path, nt: usize, chunk: usize) {
     let t0 = Instant::now();
     let lap = |what: &str| {
+        if diag::QUIET.load(Relaxed) {
+            diag::LAPS.lock().unwrap().push((what.to_string(), t0.elapsed().as_secs_f64()));
+            return;
+        }
         let (u, s) = diag::rusage();
         eprintln!("[{:7.3}s] {} cpu={:.3} user={:.3} sys={:.3}", t0.elapsed().as_secs_f64(), what, u + s, u, s)
     };
@@ -838,8 +845,9 @@ fn run(data_dir: &Path, out_dir: &Path, nt: usize, chunk: usize) {
     add_files(&data_dir.join("clicks"), 1, chunk, &mut files, &mut tasks);
     add_files(&data_dir.join("links"), 2, chunk.min(1 << 20), &mut files, &mut lk_tasks);
     let est_rows = ev_bytes / 64 + 1;
-    let b1bits = log2_ceil(est_rows / 32768).clamp(6, 11);
-    let b2bits = log2_ceil(est_rows / 32768).clamp(6, 11);
+    let env_bits = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<u32>().ok());
+    let b1bits = env_bits("FM_B1").unwrap_or(log2_ceil(est_rows / 32768).clamp(6, 11));
+    let b2bits = env_bits("FM_B2").unwrap_or(log2_ceil(est_rows / 32768).clamp(6, 11));
     for t in tasks.iter().take(2 * nt) {
         prefetch_range(&files[t.file], t.off, t.len);
     }
@@ -905,5 +913,7 @@ fn run(data_dir: &Path, out_dir: &Path, nt: usize, chunk: usize) {
     }
     write_campaign(&out_dir.join("campaign_daily").join("part-0.parquet"), &crows);
     lap("written");
-    eprintln!("user rows {} campaign rows {}", total, crows.len());
+    if !diag::QUIET.load(Relaxed) {
+        eprintln!("user rows {} campaign rows {}", total, crows.len());
+    }
 }

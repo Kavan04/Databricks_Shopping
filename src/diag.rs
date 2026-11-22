@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Diagnostics for the scoring machine, switched on with FM_DIAG=1 (never in a
 //! real run). The scorer shows a submission's logs only when its dev-set check
 //! fails, so a diagnostic build prints what we need to know and then exits 1:
@@ -9,8 +10,109 @@
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::Relaxed};
+use std::sync::Mutex;
 use std::time::Instant;
+
+/// When set, the pipeline records its stage laps here instead of printing them.
+pub static QUIET: AtomicBool = AtomicBool::new(false);
+pub static LAPS: Mutex<Vec<(String, f64)>> = Mutex::new(Vec::new());
+
+// ---------------------------------------------------------------- sampling profiler
+
+const NS: usize = 1 << 20;
+static PCS: [AtomicU64; NS] = [const { AtomicU64::new(0) }; NS];
+static NPC: AtomicUsize = AtomicUsize::new(0);
+static PROF_ON: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn on_prof(_: libc::c_int, _: *mut libc::siginfo_t, ctx: *mut libc::c_void) {
+    if !PROF_ON.load(Relaxed) {
+        return;
+    }
+    let uc = ctx as *const libc::ucontext_t;
+    #[cfg(target_arch = "x86_64")]
+    let pc = unsafe { (*uc).uc_mcontext.gregs[libc::REG_RIP as usize] as u64 };
+    #[cfg(target_arch = "aarch64")]
+    let pc = unsafe { (*uc).uc_mcontext.pc };
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    let pc = 0u64;
+    let i = NPC.fetch_add(1, Relaxed);
+    if i < NS {
+        PCS[i].store(pc, Relaxed);
+    }
+}
+
+/// Sample the program counter every `us` microseconds of process CPU time.
+fn prof_start(us: i64) {
+    NPC.store(0, Relaxed);
+    unsafe {
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = on_prof as *const () as usize;
+        sa.sa_flags = libc::SA_SIGINFO | libc::SA_RESTART;
+        libc::sigaction(libc::SIGPROF, &sa, std::ptr::null_mut());
+        let tv = libc::timeval { tv_sec: 0, tv_usec: us as libc::suseconds_t };
+        let it = libc::itimerval { it_interval: tv, it_value: tv };
+        PROF_ON.store(true, Relaxed);
+        libc::setitimer(libc::ITIMER_PROF, &it, std::ptr::null_mut());
+    }
+}
+
+fn prof_stop() {
+    unsafe {
+        let z = libc::timeval { tv_sec: 0, tv_usec: 0 };
+        let it = libc::itimerval { it_interval: z, it_value: z };
+        libc::setitimer(libc::ITIMER_PROF, &it, std::ptr::null_mut());
+    }
+    PROF_ON.store(false, Relaxed);
+}
+
+/// Hottest lines of our own code, and hottest functions, among the samples.
+/// Each sample is charged to the innermost inlined frame that lies in src/.
+fn prof_report(top_lines: usize, top_fns: usize) -> Vec<String> {
+    const OURS: [&str; 7] = ["main.rs", "scan.rs", "keys.rs", "mem.rs", "links.rs", "out.rs", "diag.rs"];
+    let n = NPC.load(Relaxed).min(NS);
+    let mut by_pc: HashMap<u64, usize> = HashMap::new();
+    for i in 0..n {
+        *by_pc.entry(PCS[i].load(Relaxed)).or_insert(0) += 1;
+    }
+    let mut by_line: HashMap<String, usize> = HashMap::new();
+    let mut by_fn: HashMap<String, usize> = HashMap::new();
+    for (&pc, &c) in &by_pc {
+        let mut frames: Vec<(String, u32, String)> = Vec::new();
+        backtrace::resolve(pc as *mut std::ffi::c_void, |sym| {
+            let file = sym.filename().and_then(|f| f.file_name()).map(|f| f.to_string_lossy().into_owned()).unwrap_or_else(|| "?".into());
+            let name = sym.name().map(|n| format!("{:#}", n)).unwrap_or_default();
+            frames.push((file, sym.lineno().unwrap_or(0), name));
+        });
+        let ours = frames.iter().find(|f| OURS.contains(&f.0.as_str())).or(frames.first());
+        let (line_key, fn_key) = match ours {
+            Some((file, line, name)) => {
+                let f: String = name.split("::").filter(|p| !p.is_empty() && !p.starts_with('{') && !p.starts_with('<')).last().unwrap_or("?").to_string();
+                (format!("{}:{} {}", file, line, f), format!("{} {}", file, f))
+            }
+            None => ("?".into(), "?".into()),
+        };
+        *by_line.entry(line_key).or_insert(0) += c;
+        *by_fn.entry(fn_key).or_insert(0) += c;
+    }
+    let pct = |c: usize| 100.0 * c as f64 / n.max(1) as f64;
+    let mut out = vec![format!("P {} samples (500us of CPU each)", n)];
+    let mut v: Vec<(usize, String)> = by_fn.into_iter().map(|(k, c)| (c, k)).collect();
+    v.sort_unstable_by(|a, b| b.cmp(a));
+    for (c, k) in v.into_iter().take(top_fns) {
+        let mut l = format!("F {:4.1}% {}", pct(c), k);
+        l.truncate(70);
+        out.push(l);
+    }
+    let mut v: Vec<(usize, String)> = by_line.into_iter().map(|(k, c)| (c, k)).collect();
+    v.sort_unstable_by(|a, b| b.cmp(a));
+    for (c, k) in v.into_iter().take(top_lines) {
+        let mut l = format!("L {:4.1}% {}", pct(c), k);
+        l.truncate(70);
+        out.push(l);
+    }
+    out
+}
 
 /// (user, system) CPU seconds used by the process so far.
 pub fn rusage() -> (f64, f64) {
@@ -314,38 +416,88 @@ fn input_access(dir: &Path, nt: usize) {
     }
 }
 
+/// One line of facts about the machine.
+fn facts() -> String {
+    let cpu = read("/proc/cpuinfo");
+    let model = cpu.lines().find(|l| l.starts_with("model name")).and_then(|l| l.split(':').nth(1)).unwrap_or("?").trim().to_string();
+    let mut caches = Vec::new();
+    for i in 0..5 {
+        let p = format!("/sys/devices/system/cpu/cpu0/cache/index{}", i);
+        if Path::new(&p).exists() {
+            caches.push(format!("L{}{}={}", read(&format!("{}/level", p)), &read(&format!("{}/type", p))[..1], read(&format!("{}/size", p))));
+        }
+    }
+    let thp = read("/sys/kernel/mm/transparent_hugepage/enabled");
+    let mut m = model;
+    m.truncate(40);
+    format!("D {} | {} | thp {} | n={:?}", m, caches.join(" "), thp, std::thread::available_parallelism().map(|n| n.get()).ok())
+}
+
 pub fn main(data_dir: &Path, nt: usize, run: &dyn Fn(&Path, &Path, usize)) {
     let t0 = Instant::now();
-    system_info();
-    microbench(nt);
     let scratch = std::path::PathBuf::from(std::env::var("SCRATCH_DIR").unwrap_or("/scratch".into()));
-    eprintln!("== dev set (1M), {} threads", nt);
-    run(data_dir, &scratch.join("out-dev"), nt);
     let reps: usize = std::env::var("FM_DIAG_REPS").ok().and_then(|v| v.parse().ok()).unwrap_or(20);
     let tiled = scratch.join("tiled");
-    let (bytes, e, _, _) = timed(|| tile(data_dir, &tiled, reps, nt));
-    eprintln!("== tiled the dev set {}x into {:?}: {} MB in {:.2}s", reps, tiled, bytes >> 20, e);
-    input_access(&tiled.join("events"), nt);
-    let variants: [(&str, usize, Option<&str>); 6] = [
-        ("default", nt, None),
-        ("default again", nt, None),
-        ("arena MADV_HUGEPAGE", nt, Some("FM_THP")),
-        ("default third", nt, None),
-        ("half the threads", (nt / 2).max(1), None),
-        ("single thread", 1, None),
+    let (bytes, te, _, _) = timed(|| tile(data_dir, &tiled, reps, nt));
+    QUIET.store(true, Relaxed);
+    let mut lines = vec![format!("T tiled {}x {} MB {:.2}s", reps, bytes >> 20, te)];
+    // (label, threads, env settings)
+    let variants: Vec<(&str, usize, Vec<(&str, &str)>)> = vec![
+        ("base", nt, vec![]),
+        ("base2", nt, vec![]),
+        ("b9", nt, vec![("FM_B1", "9"), ("FM_B2", "9")]),
+        ("b11", nt, vec![("FM_B1", "11"), ("FM_B2", "11")]),
+        ("b12", nt, vec![("FM_B1", "12"), ("FM_B2", "12")]),
+        ("b11/10", nt, vec![("FM_B1", "11"), ("FM_B2", "10")]),
+        ("ch1M", nt, vec![("FM_CHUNK", "1048576")]),
+        ("ch16M", nt, vec![("FM_CHUNK", "16777216")]),
+        ("t16", 2 * nt, vec![]),
+        ("norel", nt, vec![("FM_NORELEASE", "1")]),
+        ("base3", nt, vec![]),
     ];
-    for (i, (name, n, env)) in variants.iter().enumerate() {
-        if let Some(k) = env {
-            std::env::set_var(k, "1");
+    let short = |l: &str| match l {
+        "opened" => "o",
+        "links" => "l",
+        "stage1 parse" => "p",
+        "stage2 dedup" => "d",
+        "stage3 sessions + user_daily" => "s",
+        "written" => "w",
+        _ => "?",
+    };
+    let run_one = |label: &str, n: usize, env: &[(&str, &str)], profile: bool| -> String {
+        for (k, v) in env {
+            std::env::set_var(k, v);
         }
-        eprintln!("== run {}: {} ({} threads)", i, name, n);
-        let v0 = vmstat();
-        let (_, e, u, s) = timed(|| run(&tiled, &scratch.join(format!("out-{}", i)), *n));
-        eprintln!("   total {:.3}s user {:.3} sys {:.3} [{}]", e, u, s, vm_delta(&v0, &vmstat()));
-        if let Some(k) = env {
+        LAPS.lock().unwrap().clear();
+        let out = scratch.join(format!("out-{}", label.replace('/', "_")));
+        if profile {
+            prof_start(500);
+        }
+        let (_, e, u, s) = timed(|| run(&tiled, &out, n));
+        if profile {
+            prof_stop();
+        }
+        for (k, _) in env {
             std::env::remove_var(k);
         }
-        let _ = std::fs::remove_dir_all(scratch.join(format!("out-{}", i)));
+        let _ = std::fs::remove_dir_all(&out);
+        let mut prev = 0.0;
+        let mut parts = Vec::new();
+        for (name, t) in LAPS.lock().unwrap().iter() {
+            parts.push(format!("{}{:.3}", short(name), t - prev));
+            prev = *t;
+        }
+        format!("V {:6} {} T{:.3} u{:.2} s{:.2}", label, parts.join(" "), e, u, s)
+    };
+    for (label, n, env) in &variants {
+        lines.push(run_one(label, *n, env, false));
     }
-    eprintln!("== diagnostics done in {:.1}s; exiting 1 on purpose so the logs are shown", t0.elapsed().as_secs_f64());
+    // a profiled run of the default settings
+    lines.push(run_one("prof", nt, &[], true));
+    lines.extend(prof_report(16, 8));
+    lines.push(facts());
+    lines.push(format!("Z done {:.1}s; exit 1 on purpose", t0.elapsed().as_secs_f64()));
+    for l in &lines {
+        eprintln!("{}", l);
+    }
 }
