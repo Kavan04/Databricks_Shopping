@@ -251,6 +251,9 @@ const AHEAD: usize = 16;
 static LAHEAD: AtomicUsize = AtomicUsize::new(32);
 /// Event lines use the scanner's unconditional comma bookkeeping (FM_SCANBL).
 static SCAN_BL: AtomicBool = AtomicBool::new(false);
+/// Event and click lines use the two-pass scanner (FM_SCAN1 selects the
+/// one-pass scanner instead).
+static SCAN2: AtomicBool = AtomicBool::new(true);
 
 fn stage1(ctx: &Ctx, arena: &Arena, files: &[InFile], tasks: &[RTask], nt: usize, lt_cell: &OnceLock<LinkTable>) -> Vec<S1> {
     let next = AtomicUsize::new(0);
@@ -263,6 +266,8 @@ fn stage1(ctx: &Ctx, arena: &Arena, files: &[InFile], tasks: &[RTask], nt: usize
                     let mut es = EvSink { ctx, dc: DateCache::new(), strs: Vec::new(), ev: WcBuckets::new(nb1), pr: WcBuckets::new(nb1), blocks: Blocks::new(arena) };
                     let mut ck: Vec<Bkt<Ck>> = (0..nb2).map(|_| Bkt::new()).collect();
                     let mut cks: Vec<Ck> = Vec::new();
+                    let mut sbuf = ScanBuf::default();
+                    let two_pass = SCAN2.load(Relaxed);
                     loop {
                         let i = next.fetch_add(1, Relaxed);
                         if i >= tasks.len() {
@@ -274,7 +279,9 @@ fn stage1(ctx: &Ctx, arena: &Arena, files: &[InFile], tasks: &[RTask], nt: usize
                         let t = &tasks[i];
                         let data = lines_in(&files[t.file], t.off, t.len);
                         if t.kind == 0 {
-                            if SCAN_BL.load(Relaxed) {
+                            if two_pass {
+                                scan_records2::<7, _>(data, &mut es, &mut sbuf);
+                            } else if SCAN_BL.load(Relaxed) {
                                 scan_records::<7, true, _>(data, &mut es);
                             } else {
                                 scan_records::<7, false, _>(data, &mut es);
@@ -282,7 +289,11 @@ fn stage1(ctx: &Ctx, arena: &Arena, files: &[InFile], tasks: &[RTask], nt: usize
                         } else {
                             let lt = lt_cell.wait();
                             cks.clear();
-                            scan_records::<4, false, _>(data, &mut CkSink { es: &mut es, cks: &mut cks });
+                            if two_pass {
+                                scan_records2::<4, _>(data, &mut CkSink { es: &mut es, cks: &mut cks }, &mut sbuf);
+                            } else {
+                                scan_records::<4, false, _>(data, &mut CkSink { es: &mut es, cks: &mut cks });
+                            }
                             for j in 0..cks.len() {
                                 if j + 2 * AHEAD < cks.len() {
                                     lt.map.prefetch_filter(cks[j + 2 * AHEAD].person);
@@ -966,7 +977,8 @@ fn bench(ctx: &Ctx, files: &[InFile], tasks: &[RTask]) {
     let arena = Arena::new();
     let mut warm = Blocks::new(&arena);
     let mut res = Vec::new();
-    const NAMES: [&str; 10] = ["memchr-nl", "records", "records-bl", "+2 keys", "+2 ts", "parse_event", "parse_event-bl", "+push (fresh memory)", "+push (recycled memory)", "stage-1 sink (fresh memory)"];
+    const NAMES: [&str; 12] = ["memchr-nl", "records", "records-bl", "+2 keys", "+2 ts", "parse_event", "parse_event-bl", "+push (fresh memory)", "+push (recycled memory)", "stage-1 sink (fresh memory)", "records two-pass", "stage-1 sink two-pass"];
+    let mut sbuf = ScanBuf::default();
     let mut ns = Vec::new();
     let reps = if diag::QUIET.load(Relaxed) { 3 } else { 5 };
     for mode in 0..NAMES.len() {
@@ -1001,9 +1013,15 @@ fn bench(ctx: &Ctx, files: &[InFile], tasks: &[RTask]) {
                         ev.push(bucket(e.eid, bb), e, wb);
                     }
                 }),
-                _ => {
+                9 => {
                     let mut es = EvSink { ctx, dc: DateCache::new(), strs: Vec::new(), ev: WcBuckets::new(1usize << bb), pr: WcBuckets::new(1usize << bb), blocks: Blocks::new(&arena) };
                     scan_records::<7, false, _>(d, &mut es);
+                    acc = es.strs.len() as u64;
+                }
+                10 => scan_records2::<7, _>(d, &mut FnSink(|f: &[&[u8]; 7]| acc = acc.wrapping_add(f[2].len() as u64)), &mut sbuf),
+                _ => {
+                    let mut es = EvSink { ctx, dc: DateCache::new(), strs: Vec::new(), ev: WcBuckets::new(1usize << bb), pr: WcBuckets::new(1usize << bb), blocks: Blocks::new(&arena) };
+                    scan_records2::<7, _>(d, &mut es, &mut sbuf);
                     acc = es.strs.len() as u64;
                 }
             }
@@ -1020,7 +1038,7 @@ fn bench(ctx: &Ctx, files: &[InFile], tasks: &[RTask]) {
     }
     if diag::QUIET.load(Relaxed) {
         let v: Vec<String> = ns.iter().map(|x| format!("{:.1}", x)).collect();
-        *diag::BENCH_OUT.lock().unwrap() = format!("nl {} rec {}/{} keys {} ts {} pe {}/{} push {}/{} sink {} ns/line ({} lines)", v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8], v[9], lines);
+        *diag::BENCH_OUT.lock().unwrap() = format!("nl {} rec {}/{}/{} keys {} ts {} pe {}/{} push {}/{} sink {}/{} ns/line ({} lines)", v[0], v[1], v[2], v[10], v[3], v[4], v[5], v[6], v[7], v[8], v[9], v[11], lines);
         return;
     }
     eprintln!("bench on {} MB, {} lines:\n  {}", d.len() >> 20, lines, res.join("\n  "));
@@ -1059,6 +1077,7 @@ fn run(data_dir: &Path, out_dir: &Path, nt: usize, chunk: usize) {
     S3_DIV.store(std::env::var("FM_S3DIV").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(4).max(1), Relaxed);
     mem::PLAIN_STORES.store(std::env::var_os("FM_PLAINST").is_some(), Relaxed);
     SCAN_BL.store(std::env::var_os("FM_SCANBL").is_some(), Relaxed);
+    SCAN2.store(std::env::var_os("FM_SCAN1").is_none(), Relaxed);
     TAB_X4.store(std::env::var_os("FM_TABX4").is_some(), Relaxed);
     scan::PF_DIST.store(std::env::var("FM_PF").ok().and_then(|v| v.parse().ok()).unwrap_or(0), Relaxed);
     let lap = |what: &str| {

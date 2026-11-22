@@ -132,6 +132,147 @@ fn fields<'a, const N: usize>(d: &'a [u8], s0: usize, e0: usize, commas: &[u32; 
     Some(std::array::from_fn(|k| unsafe { std::slice::from_raw_parts(p.add(st[k]), ln[k]) }))
 }
 
+/// `fields` with the commas read from `c` (at least N - 1 entries).
+#[inline(always)]
+fn fields_at<'a, const N: usize>(d: &'a [u8], s0: usize, e0: usize, c: *const u32, nq: u32) -> Option<[&'a [u8]; N]> {
+    let p = d.as_ptr();
+    let mut st = [0usize; N];
+    let mut ln = [0usize; N];
+    let mut s = s0;
+    let mut q2 = 0u32;
+    let mut bad = false;
+    for k in 0..N {
+        let e = if k < N - 1 { (unsafe { *c.add(k) }) as usize } else { e0 };
+        let len = e - s;
+        let first = unsafe { *p.add(s) };
+        let last = unsafe { *p.add(e.max(s + 1) - 1) };
+        let qs = first == b'"';
+        let qe = (len >= 2) & (last == b'"');
+        bad |= qs & !qe;
+        q2 += 2 * qs as u32;
+        let q = (qs & qe) as usize;
+        st[k] = s + q;
+        ln[k] = len - 2 * q;
+        s = e + 1;
+    }
+    if bad || q2 != nq {
+        return None;
+    }
+    Some(std::array::from_fn(|k| unsafe { std::slice::from_raw_parts(p.add(st[k]), ln[k]) }))
+}
+
+/// Reusable buffers of `scan_records2`.
+#[derive(Default)]
+pub struct ScanBuf {
+    /// separator positions (commas and newlines), in order
+    idx: Vec<u32>,
+    /// per newline: [its rank in `idx`, quotes before it since the data start]
+    nl: Vec<[u32; 2]>,
+}
+
+/// Two-pass scanner, same results as `scan_records`. Pass 1 turns 64 KB of
+/// input into a flat list of separator positions and, per newline, its rank
+/// in that list and the running quote count, with unconditional steps (no loop
+/// over a block's lines or commas, whose exits the branch predictor cannot
+/// guess). Pass 2 cuts each line from consecutive list entries.
+#[inline(always)]
+pub fn scan_records2<'a, const N: usize, S: Sink<'a, N>>(data: &'a [u8], f: &mut S, sb: &mut ScanBuf) {
+    const { assert!(N >= 2 && N <= 9) };
+    const BATCH: usize = 64 << 10;
+    let n = data.len();
+    let p = data.as_ptr();
+    let (idx, nl) = (&mut sb.idx, &mut sb.nl);
+    idx.clear();
+    let mut qtot = 0u32; // quotes before the current block
+    let mut ls = 0usize; // start of the current line
+    let mut q_ls = 0u32; // quotes before `ls`
+    let mut r_ls = 0usize; // rank in `idx` of the first separator after `ls`
+    let mut base = 0usize;
+    while base < n {
+        let end = (base + BATCH).min(n);
+        // at most one separator per byte, plus slack for the unconditional writes
+        idx.reserve(end - base + 72);
+        nl.clear();
+        nl.reserve(end - base + 72);
+        unsafe {
+            let ip = idx.as_mut_ptr();
+            let np = nl.as_mut_ptr();
+            let (mut ni, mut nn) = (idx.len(), 0usize);
+            let mut b = base;
+            while b < end {
+                let (mut mc, mut mq, mut mn) = masks(p.add(b));
+                if n - b < 64 {
+                    let keep = (1u64 << (n - b)) - 1;
+                    mc &= keep;
+                    mq &= keep;
+                    mn &= keep;
+                }
+                let sep = mc | mn;
+                // newlines: two entries unconditionally, a loop only past two
+                let cn = mn.count_ones() as usize;
+                let mut m = mn;
+                for j in 0..2 {
+                    let below = (m & m.wrapping_neg()).wrapping_sub(1);
+                    *np.add(nn + j) = [(ni + (sep & below).count_ones() as usize) as u32, qtot + (mq & below).count_ones()];
+                    m &= m.wrapping_sub(1);
+                }
+                if cn > 2 {
+                    let mut j = 2;
+                    while m != 0 {
+                        let below = (m & m.wrapping_neg()) - 1;
+                        *np.add(nn + j) = [(ni + (sep & below).count_ones() as usize) as u32, qtot + (mq & below).count_ones()];
+                        m &= m - 1;
+                        j += 1;
+                    }
+                }
+                nn += cn;
+                // separators: eight unconditionally, a loop only past eight
+                let cs = sep.count_ones() as usize;
+                let mut t = sep;
+                for j in 0..8 {
+                    *ip.add(ni + j) = (b as u32).wrapping_add(t.trailing_zeros());
+                    t &= t.wrapping_sub(1);
+                }
+                if cs > 8 {
+                    let mut j = 8;
+                    while t != 0 {
+                        *ip.add(ni + j) = (b as u32).wrapping_add(t.trailing_zeros());
+                        t &= t - 1;
+                        j += 1;
+                    }
+                }
+                ni += cs;
+                qtot += mq.count_ones();
+                b += 64;
+            }
+            idx.set_len(ni);
+            nl.set_len(nn);
+        }
+        // pass 2: the lines that ended in this batch
+        for &[r, q] in nl.iter() {
+            let r = r as usize;
+            let e = idx[r] as usize;
+            if r - r_ls == N - 1 {
+                if let Some(fl) = fields_at::<N>(data, ls, e, unsafe { idx.as_ptr().add(r_ls) }, q - q_ls) {
+                    f.rec(&fl);
+                }
+            }
+            ls = e + 1;
+            q_ls = q;
+            r_ls = r + 1;
+        }
+        // keep only the unfinished line's separators
+        idx.drain(..r_ls);
+        r_ls = 0;
+        base = end;
+    }
+    if ls < n && idx.len() == N - 1 {
+        if let Some(fl) = fields_at::<N>(data, ls, n, idx.as_ptr(), qtot - q_ls) {
+            f.rec(&fl);
+        }
+    }
+}
+
 /// Receives the fields of each well-formed line. A hot sink marks `rec`
 /// #[inline(always)], so its work is compiled into the scanner loop instead of
 /// being called once per line (a closure's call is LLVM's choice, and for the
@@ -412,6 +553,9 @@ mod tests {
             for_each_record::<N>(&padded[..text.len()], |f| got.push(f.iter().map(|x| x.to_vec()).collect()));
             let want: Vec<Vec<Vec<u8>>> = text.split(|&b| b == b'\n').filter_map(|l| ref_fields::<N>(l)).collect();
             assert_eq!(got, want, "{:?}", String::from_utf8_lossy(&text));
+            let mut got2: Vec<Vec<Vec<u8>>> = Vec::new();
+            scan_records2::<N, _>(&padded[..text.len()], &mut FnSink(|f: &[&[u8]; N]| got2.push(f.iter().map(|x| x.to_vec()).collect())), &mut ScanBuf::default());
+            assert_eq!(got2, want, "two-pass {:?}", String::from_utf8_lossy(&text));
         }
     }
 
@@ -428,6 +572,58 @@ mod tests {
             check::<2>(seed * 7919);
             check::<4>(seed * 104729);
             check::<7>(seed * 1299709);
+        }
+    }
+
+    /// The two-pass scanner across its 64 KB batch boundaries: megabytes of
+    /// lines, some long, one longer than a whole batch, with and without a
+    /// final newline.
+    #[test]
+    fn two_pass_matches_across_batches() {
+        let mut x = 99u64;
+        let mut rnd = |n: u64| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x % n
+        };
+        for round in 0..6 {
+            let mut text = Vec::new();
+            while text.len() < (1 << 20) + 12345 * round {
+                let nf = 6 + rnd(3);
+                let big = rnd(500) == 0;
+                for k in 0..nf {
+                    if k > 0 {
+                        text.push(b',');
+                    }
+                    let len = if big && k == 2 { 70_000 + rnd(1000) } else { rnd(14) };
+                    // a stray quote now and then makes a line malformed
+                    let v: Vec<u8> = (0..len).map(|_| if rnd(400) == 0 { b'"' } else { b"abc09\r x"[rnd(8) as usize] }).collect();
+                    if rnd(5) == 0 {
+                        text.push(b'"');
+                        text.extend_from_slice(&v);
+                        text.push(b'"');
+                    } else {
+                        text.extend_from_slice(&v);
+                    }
+                }
+                if rnd(50) == 0 {
+                    text.push(b'\n');
+                }
+                text.push(b'\n');
+            }
+            if round % 2 == 1 {
+                text.pop();
+            }
+            let mut padded = text.clone();
+            padded.extend_from_slice(&[b','; PAD]);
+            let d = &padded[..text.len()];
+            let mut want: Vec<Vec<Vec<u8>>> = Vec::new();
+            for_each_record::<7>(d, |f| want.push(f.iter().map(|x| x.to_vec()).collect()));
+            let mut got: Vec<Vec<Vec<u8>>> = Vec::new();
+            scan_records2::<7, _>(d, &mut FnSink(|f: &[&[u8]; 7]| got.push(f.iter().map(|x| x.to_vec()).collect())), &mut ScanBuf::default());
+            assert!(want.len() > 1000);
+            assert_eq!(got, want);
         }
     }
 
@@ -467,6 +663,9 @@ mod tests {
             for_each_record::<7>(&padded[..text.len()], |f| got.push(f.iter().map(|x| x.to_vec()).collect()));
             let want: Vec<Vec<Vec<u8>>> = text.split(|&b| b == b'\n').filter_map(|l| ref_fields::<7>(l)).collect();
             assert_eq!(got, want, "{:?}", String::from_utf8_lossy(&text));
+            let mut got2: Vec<Vec<Vec<u8>>> = Vec::new();
+            scan_records2::<7, _>(&padded[..text.len()], &mut FnSink(|f: &[&[u8]; 7]| got2.push(f.iter().map(|x| x.to_vec()).collect())), &mut ScanBuf::default());
+            assert_eq!(got2, want, "two-pass {:?}", String::from_utf8_lossy(&text));
         }
     }
 }

@@ -26,6 +26,7 @@ Goal: the top of the Shopping Sessions leaderboard. At the time of the first sub
 | v3.14 | `33a4b24` | not submitted | field splitting without branches on field length (x86 had a compare and jump per field for length <= 1; an empty price is common and unpredictable) | full suite, both platforms |
 | v3.15 | `14060e9` | not submitted | branch-free linked-ID lookup and prefetch, branch-free dedup winner collection: single-thread dedup 0.81-0.95 s -> 0.60-0.69 s locally; clicks use the same lookup | full suite, both platforms; new unit test for the lookup |
 | v3.16 | `26b10fe` | not submitted | dedup tables at load <= 1/2 (was 3/4), split threshold 8K so tables stay at 384 KB: single-thread dedup 0.60-0.66 s -> 0.55-0.60 s locally | full suite, both platforms |
+| v3.17 | see git log | not submitted yet | two-pass scanner for events and clicks: separator index per 64 KB without data-dependent loops, then lines from consecutive entries; microbenchmark 19.9 -> 16.0-18.6 ns per line, single-thread stage 1 about 10% faster locally | full suite, both platforms, plus the one-pass scanner (`FM_SCAN1=1`) on the dev set; new tests across 64 KB batch boundaries |
 
 Local timings come from a Docker VM on an 8-core Apple-silicon Mac, with the data in `/dev/shm`. The Mac is often loaded, so one run can vary 2 to 3x. Only best-of-N is meaningful, and only the board counts.
 
@@ -127,6 +128,24 @@ Each variant runs in its own child process, so W includes exit and teardown (20x
 | 2048 + pre-fault | 3.518 |
 
 Process exit after the last lap is now about 10 ms. At 20M the stages take: parse 0.52 s, dedup 0.21 s, sessions 0.21 s, links 0.06 s, startup 0.025 s, release and campaign table 0.03 s.
+
+## v3.17: a two-pass scanner
+
+The one-pass scanner walked each 64-byte block's newlines, and within each line segment its commas. A line is about 75 bytes, so blocks hold 0, 1 or 2 newlines and a segment holds 0 to 6 commas. Both loop exits depend on the data, and the predictor cannot guess them. Instruction-level profiles put most of the scanner's time on the first instructions after those exits.
+
+`scan::scan_records2` works in two passes over 64 KB batches:
+
+1. Per block, it writes every separator position (comma or newline) into a flat list, eight unconditionally and a loop only past eight. For each newline, it writes the newline's rank in that list and the running quote count, two unconditionally and a loop only past two.
+2. Each line is then cut from consecutive list entries. The comma count is a difference of ranks, and the quote count a difference of running counts, so the per-line work has a fixed shape.
+
+The few separators of a line that crosses a batch boundary carry over to the next batch.
+
+| Single thread, 20M, 256 MB slice | One-pass | Two-pass |
+| --- | --- | --- |
+| Scanner alone (ns per line) | 19.9, 20.0 | 18.6, 16.0 |
+| Stage 1 in the pipeline (s, six runs sorted) | 1.26 1.26 1.46 1.84 1.85 2.18 | 1.18 1.25 1.29 1.54 1.69 1.83 |
+
+`FM_SCAN1=1` selects the one-pass scanner, which diagnostics compare on the scorer.
 
 ## v3.15: branches that could not be predicted
 

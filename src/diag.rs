@@ -564,14 +564,15 @@ pub fn main(data_dir: &Path, nt: usize, run: &dyn Fn(&Path, &Path, usize)) {
     let out = scratch.join("out");
     let variants: Vec<(&str, Vec<(&str, &str)>)> = vec![
         ("base", vec![]),
-        ("scanbl", vec![("FM_SCANBL", "1")]),
+        ("scan1", vec![("FM_SCAN1", "1")]),
         ("pf1k", vec![("FM_PF", "1024")]),
         ("s3div16", vec![("FM_S3DIV", "16")]),
         ("s3-24k", vec![("FM_S3MAX", "24576")]),
         ("nosub", vec![("FM_SUBMAX", "100000000")]),
         ("b9/10", vec![("FM_B2", "10")]),
         ("base2", vec![]),
-        ("scanbl2", vec![("FM_SCANBL", "1")]),
+        ("scan1bl", vec![("FM_SCAN1", "1"), ("FM_SCANBL", "1")]),
+        ("scan1-2", vec![("FM_SCAN1", "1")]),
         ("pf1k2", vec![("FM_PF", "1024")]),
         ("s3div162", vec![("FM_S3DIV", "16")]),
     ];
@@ -588,7 +589,7 @@ pub fn main(data_dir: &Path, nt: usize, run: &dyn Fn(&Path, &Path, usize)) {
     let (b, te, _, _) = timed(|| tile(data_dir, &t60, r60, nt));
     lines.push(format!("T {}x {} MB {:.2}s", r60, b >> 20, te));
     lines.push(format!("V 60:warm {}", run_child(&t60, &out, nt, &[], run)));
-    for (label, env) in [("60:base", vec![]), ("60:nos3", vec![("FM_S3MAX", "100000000")]), ("60:b10", vec![("FM_B1", "10"), ("FM_B2", "10")]), ("60:scanbl", vec![("FM_SCANBL", "1")]), ("60:base2", vec![])] {
+    for (label, env) in [("60:base", vec![]), ("60:nos3", vec![("FM_S3MAX", "100000000")]), ("60:b10", vec![("FM_B1", "10"), ("FM_B2", "10")]), ("60:scan1", vec![("FM_SCAN1", "1")]), ("60:base2", vec![])] {
         lines.push(format!("V {:7} {}", label, run_child(&t60, &out, nt, &env, run)));
     }
     let _ = std::fs::remove_dir_all(&t60);
