@@ -207,6 +207,8 @@ fn parse_click(ctx: &Ctx, f: &[&[u8]; 4], dc: &mut DateCache, strs: &mut Vec<(u6
 const AHEAD: usize = 16;
 /// Lookahead of stage 2's person lookups.
 static LAHEAD: AtomicUsize = AtomicUsize::new(32);
+/// Lookahead of stage 2's dedup-table inserts (0 = off; a diagnostics switch).
+static TAHEAD: AtomicUsize = AtomicUsize::new(0);
 
 fn stage1(ctx: &Ctx, arena: &Arena, files: &[InFile], tasks: &[RTask], nt: usize, lt_cell: &OnceLock<LinkTable>) -> Vec<S1> {
     let next = AtomicUsize::new(0);
@@ -311,10 +313,14 @@ fn stage2(ctx: &Ctx, s1: &[S1], lt: &LinkTable, arena: &Arena, nt: usize) -> Vec
                         table.clear();
                         table.resize(cap, E1::default());
                         let slot = |eid: u64| ((mix(eid) << b1bits) >> (64 - tbits)) as usize;
+                        let tahead = TAHEAD.load(Relaxed);
                         for w in s1 {
                             for sg in &w.ev[b] {
                                 let recs = sg.slice();
-                                for r in recs {
+                                for (k, r) in recs.iter().enumerate() {
+                                    if tahead > 0 && k + tahead < recs.len() {
+                                        prefetch(unsafe { table.as_ptr().add(slot(recs[k + tahead].eid)) });
+                                    }
                                     let mut i = slot(r.eid);
                                     loop {
                                         let t = unsafe { table.get_unchecked_mut(i) };
@@ -850,6 +856,8 @@ fn main() {
 /// The whole pipeline: `data_dir` in, both tables written under `out_dir`.
 fn run(data_dir: &Path, out_dir: &Path, nt: usize, chunk: usize) {
     let t0 = Instant::now();
+    TAHEAD.store(std::env::var("FM_TAHEAD").ok().and_then(|v| v.parse().ok()).unwrap_or(0), Relaxed);
+    mem::PLAIN_STORES.store(std::env::var_os("FM_PLAINST").is_some(), Relaxed);
     let lap = |what: &str| {
         if diag::QUIET.load(Relaxed) {
             diag::LAPS.lock().unwrap().push((what.to_string(), t0.elapsed().as_secs_f64()));

@@ -267,10 +267,23 @@ pub fn seg_len<T>(v: &[Seg<T>]) -> usize {
 #[repr(C, align(64))]
 pub struct Line<T: Copy, const R: usize>([T; R]);
 
+/// Diagnostics switch: flush write-combining lines with ordinary stores.
+pub static PLAIN_STORES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Copy 64 bytes to a 64-byte aligned destination (non-temporal unless PLAIN_STORES).
+#[inline(always)]
+unsafe fn store_line(dst: *mut u8, src: *const u8) {
+    if PLAIN_STORES.load(Relaxed) {
+        std::ptr::copy_nonoverlapping(src, dst, 64);
+    } else {
+        stream_line(dst, src);
+    }
+}
+
 /// Copy 64 bytes to a 64-byte aligned destination, bypassing the cache.
 #[cfg(all(target_arch = "x86_64", target_feature = "avx"))]
 #[inline(always)]
-unsafe fn store_line(dst: *mut u8, src: *const u8) {
+unsafe fn stream_line(dst: *mut u8, src: *const u8) {
     use core::arch::x86_64::*;
     let a = _mm256_load_si256(src as *const __m256i);
     let b = _mm256_load_si256(src.add(32) as *const __m256i);
@@ -279,7 +292,7 @@ unsafe fn store_line(dst: *mut u8, src: *const u8) {
 }
 #[cfg(all(target_arch = "x86_64", not(target_feature = "avx")))]
 #[inline(always)]
-unsafe fn store_line(dst: *mut u8, src: *const u8) {
+unsafe fn stream_line(dst: *mut u8, src: *const u8) {
     use core::arch::x86_64::*;
     for i in 0..4 {
         _mm_stream_si128(dst.add(16 * i) as *mut __m128i, _mm_load_si128(src.add(16 * i) as *const __m128i));
@@ -287,7 +300,7 @@ unsafe fn store_line(dst: *mut u8, src: *const u8) {
 }
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
-unsafe fn store_line(dst: *mut u8, src: *const u8) {
+unsafe fn stream_line(dst: *mut u8, src: *const u8) {
     use core::arch::aarch64::*;
     let a = vld1q_u8(src);
     let b = vld1q_u8(src.add(16));
@@ -302,7 +315,7 @@ unsafe fn store_line(dst: *mut u8, src: *const u8) {
 }
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 #[inline(always)]
-unsafe fn store_line(dst: *mut u8, src: *const u8) {
+unsafe fn stream_line(dst: *mut u8, src: *const u8) {
     std::ptr::copy_nonoverlapping(src, dst, 64);
 }
 

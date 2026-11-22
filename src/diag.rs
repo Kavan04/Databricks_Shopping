@@ -508,6 +508,42 @@ fn run_child(data: &Path, out: &Path, n: usize, env: &[(&str, &str)], run: &dyn 
     format!("{} W{:.3} u{:.2} s{:.2}{}", String::from_utf8_lossy(&buf[..got]), wall, tv(ru.ru_utime), tv(ru.ru_stime), if status != 0 { " FAIL" } else { "" })
 }
 
+/// Cost of getting fresh writable memory on this machine, per 4 KiB page.
+fn memcost(nt: usize) -> String {
+    const SZ: usize = 512 << 20;
+    let mut parts = Vec::new();
+    for threads in [1usize, nt] {
+        let p = map(SZ, false) as usize;
+        let (_, e, u, s) = timed(|| {
+            std::thread::scope(|sc| {
+                for t in 0..threads {
+                    sc.spawn(move || {
+                        let per = SZ / threads;
+                        for i in (t * per..(t + 1) * per).step_by(4096) {
+                            unsafe { (p as *mut u8).add(i).write_volatile(1) };
+                        }
+                    });
+                }
+            })
+        });
+        parts.push(format!("anon{}t {:.2}us/pg(cpu {:.2})", threads, e * 1e6 / (SZ / 4096) as f64, (u + s) * 1e6 / (SZ / 4096) as f64));
+        unsafe { libc::munmap(p as *mut libc::c_void, SZ) };
+    }
+    // page cache: write() a file, then map it back
+    let scratch = std::path::PathBuf::from(std::env::var("SCRATCH_DIR").unwrap_or("/scratch".into()));
+    let path = scratch.join("memcost.bin");
+    let buf = vec![7u8; 4 << 20];
+    let (_, e, u, s) = timed(|| {
+        let mut f = std::fs::File::create(&path).unwrap();
+        for _ in 0..SZ / buf.len() {
+            f.write_all(&buf).unwrap();
+        }
+    });
+    parts.push(format!("pcwrite {:.2}us/pg(cpu {:.2})", e * 1e6 / (SZ / 4096) as f64, (u + s) * 1e6 / (SZ / 4096) as f64));
+    let _ = std::fs::remove_file(&path);
+    format!("M {}", parts.join(" "))
+}
+
 pub fn main(data_dir: &Path, nt: usize, run: &dyn Fn(&Path, &Path, usize)) {
     let t0 = Instant::now();
     let scratch = std::path::PathBuf::from(std::env::var("SCRATCH_DIR").unwrap_or("/scratch".into()));
@@ -520,17 +556,16 @@ pub fn main(data_dir: &Path, nt: usize, run: &dyn Fn(&Path, &Path, usize)) {
     lines.push(format!("T {}x {} MB {:.2}s", r20, b >> 20, te));
     let out = scratch.join("out");
     let variants: Vec<(&str, Vec<(&str, &str)>)> = vec![
-        ("b10", vec![("FM_B1", "10"), ("FM_B2", "10")]),
-        ("b9", vec![]),
-        ("b8", vec![("FM_B1", "8"), ("FM_B2", "8")]),
-        ("b7", vec![("FM_B1", "7"), ("FM_B2", "7")]),
-        ("b8/9", vec![("FM_B1", "8"), ("FM_B2", "9")]),
-        ("norel", vec![("FM_NORELEASE", "1")]),
-        ("norelin", vec![("FM_NORELIN", "1")]),
-        ("norelar", vec![("FM_NORELAR", "1")]),
-        ("pop", vec![("FM_POP", "1")]),
-        ("pophuge", vec![("FM_POP", "huge")]),
-        ("b9again", vec![]),
+        ("base", vec![]),
+        ("plainst", vec![("FM_PLAINST", "1")]),
+        ("tah4", vec![("FM_TAHEAD", "4")]),
+        ("tah8", vec![("FM_TAHEAD", "8")]),
+        ("tah16", vec![("FM_TAHEAD", "16")]),
+        ("lnk2", vec![("FM_LINK_THREADS", "2")]),
+        ("lnk5", vec![("FM_LINK_THREADS", "5")]),
+        ("b9/10", vec![("FM_B2", "10")]),
+        ("b10/9", vec![("FM_B1", "10")]),
+        ("base2", vec![]),
     ];
     for (label, env) in &variants {
         lines.push(format!("V {:7} {}", label, run_child(&t20, &out, nt, env, run)));
@@ -540,10 +575,11 @@ pub fn main(data_dir: &Path, nt: usize, run: &dyn Fn(&Path, &Path, usize)) {
     let _ = std::fs::remove_dir_all(&t20);
     let (b, te, _, _) = timed(|| tile(data_dir, &t60, r60, nt));
     lines.push(format!("T {}x {} MB {:.2}s", r60, b >> 20, te));
-    for (label, env) in [("60:auto", vec![]), ("60:b10", vec![("FM_B1", "10"), ("FM_B2", "10")]), ("60:b9", vec![("FM_B1", "9"), ("FM_B2", "9")]), ("60:pop", vec![("FM_POP", "1")])] {
+    for (label, env) in [("60:base", vec![]), ("60:b10/9", vec![("FM_B1", "10")]), ("60:tah8", vec![("FM_TAHEAD", "8")]), ("60:plain", vec![("FM_PLAINST", "1")])] {
         lines.push(format!("V {:7} {}", label, run_child(&t60, &out, nt, &env, run)));
     }
     let _ = std::fs::remove_dir_all(&t60);
+    lines.push(memcost(nt));
     lines.push(facts());
     lines.push(format!("Z done {:.1}s; exit 1 on purpose", t0.elapsed().as_secs_f64()));
     for l in &lines {

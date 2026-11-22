@@ -18,7 +18,8 @@ Goal: the top of the Shopping Sessions leaderboard. At the time of the first sub
 | v3.6 | `300031f` | not submitted | 512 buckets by default (best on the scorer) | full suite, both platforms; 20M identical to v1 |
 | v3.7 | `2ea5cf5` | not submitted | two-stage prefetch for person lookups: the filter word is fetched before it is checked, so the prefetch pass no longer stalls on it | full suite, both platforms; 20M identical to v1 |
 | v3.8 | `2fe4a4a` | not submitted | link joining overlapped with event parsing; 512 buckets at every scale; startup without per-line allocations; unused event blocks released at the end of stage 2 | full suite, both platforms; 20M identical to v1 |
-| v3.9 | see git log | not submitted yet | 24-byte event records: push 2.5 to 5 ns per line instead of 10 to 14; single-thread total 3.46 s vs 3.53 s | full suite, both platforms; 20M identical to v1 |
+| v3.9 | `fb3b6c7` | not submitted | 24-byte event records: push 2.5 to 5 ns per line instead of 10 to 14; single-thread total 3.46 s vs 3.53 s | full suite, both platforms; 20M identical to v1 |
+| v3.10 | see git log | not submitted yet | Parquet streamed to disk page by page (about 90 MB less fresh memory); diagnostics switches for plain vs streaming stores and dedup-table prefetch | full suite, both platforms; 20M identical to v1 in polars, pyarrow and DuckDB |
 
 Local timings come from a Docker VM on an 8-core Apple-silicon Mac, with the data in `/dev/shm`. The Mac is often loaded, so one run can vary 2 to 3x. Only best-of-N is meaningful, and only the board counts.
 

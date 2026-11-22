@@ -134,34 +134,36 @@ struct ColMeta {
     bytes: u64,
 }
 
-/// One output file being assembled in memory.
+/// One output file, streamed to disk a page at a time through a 1 MB buffer.
+/// Fresh memory costs page faults on the scorer, so no file is assembled whole.
 struct File {
-    buf: Vec<u8>,
+    w: std::io::BufWriter<std::fs::File>,
+    pos: u64,
+    body: Vec<u8>,
     cols: Vec<ColMeta>,
     rows: usize,
 }
 
 impl File {
-    fn new(rows: usize, cap: usize) -> Self {
-        let mut buf = Vec::with_capacity(cap);
-        buf.extend_from_slice(b"PAR1");
-        File { buf, cols: Vec::new(), rows }
+    fn new(path: &Path, rows: usize) -> Self {
+        let mut w = std::io::BufWriter::with_capacity(1 << 20, std::fs::File::create(path).unwrap());
+        w.write_all(b"PAR1").unwrap();
+        File { w, pos: 4, body: Vec::new(), cols: Vec::new(), rows }
     }
 
     /// Append one column chunk: for each page of rows, `page(start, end, body)`
     /// writes that page's encoded values (and definition levels) into `body`.
     fn column(&mut self, name: &'static str, kind: Kind, mut page: impl FnMut(usize, usize, &mut Vec<u8>)) {
-        let offset = self.buf.len() as u64;
-        let mut body = Vec::new();
+        let offset = self.pos;
         let mut s = 0;
         while s < self.rows {
             let e = (s + PAGE_ROWS).min(self.rows);
-            body.clear();
-            page(s, e, &mut body);
+            self.body.clear();
+            page(s, e, &mut self.body);
             let mut h = Thrift::new();
             h.i32(1, 0); // DATA_PAGE
-            h.i32(2, body.len() as i32);
-            h.i32(3, body.len() as i32);
+            h.i32(2, self.body.len() as i32);
+            h.i32(3, self.body.len() as i32);
             h.begin(5);
             h.i32(1, (e - s) as i32);
             h.i32(2, ENC_PLAIN);
@@ -169,14 +171,15 @@ impl File {
             h.i32(4, ENC_RLE);
             h.end();
             h.b.push(0);
-            self.buf.extend_from_slice(&h.b);
-            self.buf.extend_from_slice(&body);
+            self.w.write_all(&h.b).unwrap();
+            self.w.write_all(&self.body).unwrap();
+            self.pos += (h.b.len() + self.body.len()) as u64;
             s = e;
         }
-        self.cols.push(ColMeta { name, kind, offset, bytes: self.buf.len() as u64 - offset });
+        self.cols.push(ColMeta { name, kind, offset, bytes: self.pos - offset });
     }
 
-    fn finish(mut self, path: &Path) {
+    fn finish(mut self) {
         let mut t = Thrift::new();
         t.i32(1, 1); // version
         t.list(2, T_STRUCT, self.cols.len() + 1);
@@ -251,11 +254,10 @@ impl File {
         }
         t.bin(6, b"shopping-sessions");
         t.b.push(0);
-        self.buf.extend_from_slice(&t.b);
-        self.buf.extend_from_slice(&(t.b.len() as u32).to_le_bytes());
-        self.buf.extend_from_slice(b"PAR1");
-        let mut f = std::fs::File::create(path).unwrap();
-        f.write_all(&self.buf).unwrap();
+        self.w.write_all(&t.b).unwrap();
+        self.w.write_all(&(t.b.len() as u32).to_le_bytes()).unwrap();
+        self.w.write_all(b"PAR1").unwrap();
+        self.w.flush().unwrap();
     }
 }
 
@@ -291,7 +293,7 @@ fn def_levels(body: &mut Vec<u8>, present: impl Iterator<Item = bool>, n: usize)
 
 /// `name(person, buf)` appends the person's name to buf.
 pub fn write_user(path: &Path, rows: &[URow], cats: &[&[u8]], name: &(dyn Fn(u64, &mut Vec<u8>) + Sync)) {
-    let mut f = File::new(rows.len(), rows.len() * 48 + 4096);
+    let mut f = File::new(path, rows.len());
     f.column("user_id", Kind::Str, |s, e, body| {
         let mut nb = Vec::with_capacity(16);
         for r in &rows[s..e] {
@@ -326,11 +328,11 @@ pub fn write_user(path: &Path, rows: &[URow], cats: &[&[u8]], name: &(dyn Fn(u64
         def_levels(body, part.iter().map(|r| r.top != NONE_CAT), part.len());
         plain_str(body, part.iter().filter(|r| r.top != NONE_CAT).map(|r| cats[r.top as usize]));
     });
-    f.finish(path);
+    f.finish();
 }
 
 pub fn write_campaign(path: &Path, rows: &[CRow]) {
-    let mut f = File::new(rows.len(), rows.len() * 64 + 4096);
+    let mut f = File::new(path, rows.len());
     f.column("campaign_id", Kind::Str, |s, e, body| plain_str(body, rows[s..e].iter().map(|r| &r.id[..])));
     f.column("channel", Kind::Str, |s, e, body| plain_str(body, rows[s..e].iter().map(|r| &r.ch[..])));
     f.column("day", Kind::Date, |s, e, body| {
@@ -350,5 +352,5 @@ pub fn write_campaign(path: &Path, rows: &[CRow]) {
             }
         });
     }
-    f.finish(path);
+    f.finish();
 }
