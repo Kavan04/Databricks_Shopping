@@ -113,7 +113,16 @@ struct Ctx {
 /// Key for small exact-string tables (never 0).
 #[inline(always)]
 fn skey(s: &[u8]) -> u64 {
-    h64(s) | 1
+    // product and campaign IDs (`p24402`, `c_123`) fit in 7 bytes: packed with
+    // their length they are exact and need no hashing; longer ones are hashed
+    // with the top bit set, so the two kinds never collide. Needs 8 readable
+    // bytes at `s` (every buffer handed to the scanner has PAD after it).
+    let n = s.len();
+    if (1..=7).contains(&n) {
+        let w = u64::from_le(unsafe { (s.as_ptr() as *const u64).read_unaligned() }) & (u64::MAX >> (8 * (8 - n)));
+        return w | ((n as u64) << 56);
+    }
+    h64(s) | 1 | (1 << 63)
 }
 
 #[inline(always)]
